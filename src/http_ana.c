@@ -1545,12 +1545,19 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	 * upgrade. It is not so strict because there is no test on the Upgrade
 	 * header content. But it is probably stronger enough for now.
 	 */
-	if (txn->status == 101 &&
-	    (!(txn->req.flags & HTTP_MSGF_CONN_UPG) || !(txn->rsp.flags & HTTP_MSGF_CONN_UPG))) {
-		if (objt_server(s->target))
-			health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_HDRRSP);
-		goto return_bad_res;
-	}
+	/*
+	 * Modified by bholbrook@beyondtrust.com
+	 * We intentionally relax this requirement that 101 responses are only allowed if
+	 * both the client and server sent `connection: upgrade` header.
+	 * As of 2023.03.09, our ECM client does not include this request header, maybe
+	 * others as well.
+	 */
+	//if (txn->status == 101 &&
+	//    (!(txn->req.flags & HTTP_MSGF_CONN_UPG) || !(txn->rsp.flags & HTTP_MSGF_CONN_UPG))) {
+	//	if (objt_server(s->target))
+	//		health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_HDRRSP);
+	//	goto return_bad_res;
+	//}
 
 	/*
 	 * 2: check for cacheability.
@@ -4665,6 +4672,21 @@ void http_server_error(struct stream *s, struct stconn *sc, int err,
 		s->flags |= err;
 	if (!(s->flags & SF_FINST_MASK))
 		s->flags |= finst;
+
+	/*
+	 * Modified by bholbrook@beyondtrust.com
+	 * We want internal errors to count against http_fail_cnt, mostly to catch errors of type
+	 * STRM_ET_QUEUE_TO and STRM_ET_CONN_TO, which usually occurs when Apache stops accepting new
+	 * connections, which occurs when all of its workers are busy. New requests linger here in
+	 * haproxy until they hit `timeout queue` or `timeout connect`, at which point src/backend.c
+	 * calls `http_return_srv_error()` which calls us here.
+	 * We want these 503 responses to count against each client's fail_cnt, so if a single client
+	 * is responsible for using up all of the backend Apache workers, we can tarpit/deny them.
+	 * Seems like an obvious use case for http_fail_cnt, so I'm not sure why haproxy doesn't
+	 * increment in these situations
+	 */
+	if (s->txn->status >= 500 && s->txn->status != 501 && s->txn->status != 505)
+		stream_inc_http_fail_ctr(s);
 
 	http_reply_and_close(s, s->txn->status, msg);
 }
