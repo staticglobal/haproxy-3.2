@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 3.2
-                              2025/06/11
+                              2025/07/02
 
 
 This document covers the configuration language as implemented in the version
@@ -10639,8 +10639,23 @@ no option prefer-last-server
   desirable in these environments as well, to avoid redistributing the traffic
   after every other response.
 
-  If this option has been enabled in a "defaults" section, it can be disabled
-  in a specific instance by prepending the "no" keyword before it.
+  It may be useful to precise here, which load balancing algorithms are
+  considered deterministic. Deterministic algorithms will always select the same
+  server for a given client data, assuming the set of available servers has not
+  changed. In general, deterministic algorithms involve hasing or lookups on the
+  incoming requests to choose the target server. However, this is not always the
+  case; "static-rr", for example, can be also considered as deterministic because
+  the server choice is based on the server's static weight, making the selection
+  predictable. "sticky" algorithm provides deterministic routing for the
+  returning clients.
+
+  As for non-deterministic algorithms, these algorithms select a server based on
+  dynamic server state or simple rotation, so two consecutive requests are not
+  guaranteed to land on the same server. option prefer-last-server is designed
+  specifically for these. roundrobin, leastconn are examples of such algorithms.
+
+  If this option has been enabled in a "defaults" section, it can be
+  disabled in a specific instance by prepending the "no" keyword before it.
 
   See also: "option http-keep-alive"
 
@@ -16538,6 +16553,10 @@ crt-list <file>
     configuration, the default certificates could be explicited (with a '*'
     filter) at the beginning of the list, so an implicit default is not added
     before.
+    Due to multi-cert bundles being duplicated for each algorithm in the
+    crt-list, only one algorithm will occupy the first line in the crt-list and
+    be considered as default. Either specify the entire bundle as default by
+    declaring '*' as the filter or setting it on the bind line.
 
     The "show ssl sni" command on the stats socket could be used to debug your
     configuration. (See "show ssl sni" in the management guide)
@@ -16867,9 +16886,16 @@ prefer-client-ciphers
   Use the client's preference when selecting the cipher suite, by default
   the server's preference is enforced. This option is also available on
   global statement "ssl-default-bind-options".
+
   Note that with OpenSSL >= 1.1.1 ChaCha20-Poly1305 is reprioritized anyway
   (without setting this option), if a ChaCha20-Poly1305 cipher is at the top of
   the client cipher list.
+
+  When using a dual algorithms setup (RSA + ECDSA), the selection algorithm
+  will chose between RSA and ECDSA and will always prioritize ECDSA. Once the
+  right certificate is chosen, it will let the SSL library prioritize ciphers,
+  curves etc. Meaning this option can't be used to prioritize an RSA
+  certificate over an ECDSA one.
 
 proto <name>
   Forces the multiplexer's protocol to use for the incoming connections. It
@@ -20436,11 +20462,14 @@ jwt_payload_query([<json_path>[,<output_type>]])
 jwt_verify(<alg>,<key>)
   Performs a signature verification for the JSON Web Token (JWT) given in input
   by using the <alg> algorithm and the <key> parameter, which should either
-  hold a secret or a path to a public certificate. Returns 1 in case of
-  verification success, 0 in case of verification error and a strictly negative
-  value for any other error. Because of all those non-null error return values,
-  the result of this converter should never be converted to a boolean. See
-  below for a full list of the possible return values.
+  hold a secret or a path to a public key. The public key should either be in
+  the PKCS#1 format (for RSA keys, starting with BEGIN RSA PUBLIC KEY) or SPKI
+  format (Subject Public Key Info, starting with BEGIN PUBLIC KEY).
+  Returns 1 in case of verification success, 0 in case of verification failure
+  and a strictly negative value for any other error. Because of all those
+  non-null error return values, the result of this converter should never be
+  converted to a boolean. See below for a full list of the possible return
+  values.
 
   For now, only JWS tokens using the Compact Serialization format can be
   processed (three dot-separated base64-url encoded strings). All the
@@ -20449,16 +20478,16 @@ jwt_verify(<alg>,<key>)
 
   If the used algorithm is of the HMAC family, <key> should be the secret used
   in the HMAC signature calculation. Otherwise, <key> should be the path to the
-  public certificate that can be used to validate the token's signature. All
-  the certificates that might be used to verify JWTs must be known during init
-  in order to be added into a dedicated certificate cache so that no disk
-  access is required during runtime. For this reason, any used certificate must
-  be mentioned explicitly at least once in a jwt_verify call. Passing an
-  intermediate variable as second parameter is then not advised.
+  public key that can be used to validate the token's signature. All the public
+  keys that might be used to verify JWTs must be known during init in order to
+  be added into a dedicated cache so that no disk access is required during
+  runtime. For this reason, any used public key must be mentioned explicitly at
+  least once in a jwt_verify call. Passing an intermediate variable as second
+  parameter is then not advised.
 
   This converter only verifies the signature of the token and does not perform
   a full JWT validation as specified in section 7.2 of RFC7519. We do not
-  ensure that the header and payload contents are fully valid JSON's once
+  ensure that the header and payload contents are fully valid JSONs once
   decoded for instance, and no checks are performed regarding their respective
   contents.
 
@@ -20485,7 +20514,7 @@ jwt_verify(<alg>,<key>)
      http-request set-var(txn.bearer) http_auth_bearer
      http-request set-var(txn.jwt_alg) var(txn.bearer),jwt_header_query('$.alg')
      http-request deny unless { var(txn.jwt_alg) -m str "RS256" }
-     http-request deny unless { var(txn.bearer),jwt_verify(txn.jwt_alg,"/path/to/crt.pem") 1 }
+     http-request deny unless { var(txn.bearer),jwt_verify(txn.jwt_alg,"/path/to/pubkey.pem") 1 }
 
 language(<value>[,<default>])
   Returns the value with the highest q-factor from a list as extracted from the

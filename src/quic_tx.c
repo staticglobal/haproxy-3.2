@@ -639,9 +639,7 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 			 * to stay under MTU limit.
 			 */
 			if (!dglen) {
-				if (cc)
-					end = pos + QUIC_MIN_CC_PKTSIZE;
-				else if (!quic_peer_validated_addr(qc) && qc_is_listener(qc))
+				if (!quic_peer_validated_addr(qc) && qc_is_listener(qc))
 					end = pos + QUIC_MIN(qc->path->mtu, quic_may_send_bytes(qc));
 				else
 					end = pos + qc->path->mtu;
@@ -1672,6 +1670,7 @@ static void qc_build_cc_frm(struct quic_conn *qc, struct quic_enc_level *qel,
 			 * converting to a CONNECTION_CLOSE of type 0x1c.
 			 */
 			out->type = QUIC_FT_CONNECTION_CLOSE;
+			out->connection_close.frame_type = 0;
 			out->connection_close.error_code = QC_ERR_APPLICATION_ERROR;
 			out->connection_close.reason_phrase_len = 0;
 		}
@@ -1683,6 +1682,7 @@ static void qc_build_cc_frm(struct quic_conn *qc, struct quic_enc_level *qel,
 	}
 	else {
 		out->type = QUIC_FT_CONNECTION_CLOSE;
+		out->connection_close.frame_type = 0;
 		out->connection_close.error_code = qc->err.code;
 		out->connection_close.reason_phrase_len = 0;
 	}
