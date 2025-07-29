@@ -4673,21 +4673,6 @@ void http_server_error(struct stream *s, struct stconn *sc, int err,
 	if (!(s->flags & SF_FINST_MASK))
 		s->flags |= finst;
 
-	/*
-	 * Modified by bholbrook@beyondtrust.com
-	 * We want internal errors to count against http_fail_cnt, mostly to catch errors of type
-	 * STRM_ET_QUEUE_TO and STRM_ET_CONN_TO, which usually occurs when Apache stops accepting new
-	 * connections, which occurs when all of its workers are busy. New requests linger here in
-	 * haproxy until they hit `timeout queue` or `timeout connect`, at which point src/backend.c
-	 * calls `http_return_srv_error()` which calls us here.
-	 * We want these 503 responses to count against each client's fail_cnt, so if a single client
-	 * is responsible for using up all of the backend Apache workers, we can tarpit/deny them.
-	 * Seems like an obvious use case for http_fail_cnt, so I'm not sure why haproxy doesn't
-	 * increment in these situations
-	 */
-	if (s->txn->status >= 500 && s->txn->status != 501 && s->txn->status != 505)
-		stream_inc_http_fail_ctr(s);
-
 	http_reply_and_close(s, s->txn->status, msg);
 }
 
@@ -4915,6 +4900,18 @@ void http_return_srv_error(struct stream *s, struct stconn *sc)
 	}
 	else if (err_type & STRM_ET_QUEUE_TO) {
 		s->txn->status = 503;
+		/*
+		 * Modified by bholbrook@beyondtrust.com
+		 * We want this error to count against http_fail_cnt, which usually occurs when Apache stops
+		 * accepting new connections, which occurs when all of its workers are busy. New requests
+		 * linger here in haproxy until they hit `timeout queue` or `timeout connect`, at which
+		 * point src/backend.c calls `http_return_srv_error()` here.
+		 * We want these 503 responses to count against each client's fail_cnt, so if a single client
+		 * is responsible for using up all of the backend Apache workers, we can tarpit/deny them.
+		 * Seems like an obvious use case for http_fail_cnt, so I'm not sure why haproxy doesn't
+		 * increment in these situations
+		 */
+		stream_inc_http_fail_ctr(s);
 		http_server_error(s, sc, SF_ERR_SRVTO, SF_FINST_Q,
 				  http_error_message(s));
 	}
