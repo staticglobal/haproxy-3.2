@@ -200,6 +200,12 @@ list of options is :
   -c : only performs a check of the configuration files and exits before trying
     to bind. The exit status is zero if everything is OK, or non-zero if an
     error is encountered. Presence of warnings will be reported if any.
+    By default this option does not report a success message. Combined with
+    "-V" this will print the message "Configuration file is valid" upon
+    success.
+
+    Scripts must use the exit status to determine the success of the
+    command.
 
   -cc : evaluates a condition as used within a conditional block of the
     configuration. The exit status is zero if the condition is true, 1 if the
@@ -1327,6 +1333,25 @@ Here is the list of static fields using the proxy statistics domain:
  97. used_conn_cur [...S]: current number of connections in use
  98. need_conn_est [...S]: estimated needed number of connections
  99. uweight [..BS]: total user weight (backend), server user weight (server)
+ 100. agg_server_status [..B.]: backend aggregated gauge of server's status
+ 101. agg_server_status_check [..B.]: (deprecated)
+ 102. agg_check_status [..B.]: backend aggregated gauge of server's state check
+      status
+ 103. srid [...S]: server id revision
+ 104. sess_other [.F..]: total number of sessions other than HTTP since process
+      started
+ 105. h1_sess [.F..]: total number of HTTP/1 sessions since process started
+ 106. h2_sess [.F..]: total number of HTTP/2 sessions since process started
+ 107. h3_sess [.F..]: total number of HTTP/3 sessions since process started
+ 108. req_other [.F..]: total number of sessions other than HTTP processed by
+      this object since the worker process started
+ 109. h1req [.F..]: total number of HTTP/1 sessions processed by this object
+      since the worker process started
+ 110. h2req [.F..]: total number of hTTP/2 sessions processed by this object
+      since the worker process started
+ 111. h3req [.F..]: total number of HTTP/3 sessions processed by this object
+      since the worker process started
+ 112. proto [L...]: protocol
 
 For all other statistics domains, the presence or the order of the fields are
 not guaranteed. In this case, the header line should always be used to parse
@@ -4347,6 +4372,11 @@ Example:
   case the full command ends at the end of line or semi-colon like any regular
   command.
 
+  Bugs: the sockpair@ protocol used to implement communication between the
+  master and the worker is known to not be reliable on macOS because of an
+  issue in the macOS sendmsg(2) implementation. A command might end up without
+  response because of that.
+
   Examples:
 
     $ socat /var/run/haproxy-master.sock readline
@@ -4412,6 +4442,11 @@ Example:
   closing the connection or by quitting the worker process (using the "quit"
   command). In this case, the prompt mode of the master socket (interactive,
   prompt, timed) is propagated into the worker process.
+
+  Bugs: the sockpair@ protocol used to implement communication between the
+  master and the worker is known to not be reliable on macOS because of an
+  issue in the macOS sendmsg(2) implementation. A command might end up without
+  response because of that.
 
   Examples:
     # gracefully close connections and delete a server once idle (wait max 10s)

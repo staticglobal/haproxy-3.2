@@ -164,13 +164,15 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 
 	if (al) {
 		al->ctx  = ARGC_ACL;   // to report errors while resolving args late
-		al->kw   = *args;
 		al->conv = NULL;
 	}
 
 	aclkw = find_acl_kw(args[0]);
 	if (aclkw) {
 		/* OK we have a real ACL keyword */
+
+		if (al)
+			al->kw = aclkw->kw;
 
 		/* build new sample expression for this ACL */
 		smp = calloc(1, sizeof(*smp));
@@ -1336,6 +1338,10 @@ int smp_fetch_acl_parse(struct arg *args, char **err_msg)
 	for (i = 0; args[i].type != ARGT_STOP; i++)
 		;
 	acl_sample = calloc(1, sizeof(struct acl_sample) + sizeof(struct acl_term) * i);
+	if (unlikely(!acl_sample)) {
+		memprintf(err_msg, "out of memory when parsing ACL expression");
+		return 0;
+	}
 	LIST_INIT(&acl_sample->suite.terms);
 	LIST_INIT(&acl_sample->cond.suites);
 	LIST_APPEND(&acl_sample->cond.suites, &acl_sample->suite.list);

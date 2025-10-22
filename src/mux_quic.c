@@ -324,15 +324,12 @@ static void qcc_refresh_timeout(struct qcc *qcc)
 	 * processed if shutdown already one or connection is idle.
 	 */
 	if (!conn_is_back(qcc->conn)) {
-		if (qcc->nb_hreq && qcc->app_st < QCC_APP_ST_SHUT) {
-			TRACE_DEVEL("one or more requests still in progress", QMUX_EV_QCC_WAKE, qcc->conn);
+		if (!LIST_ISEMPTY(&qcc->send_list) || !LIST_ISEMPTY(&qcc->tx.frms)) {
+			TRACE_DEVEL("pending output data", QMUX_EV_QCC_WAKE, qcc->conn);
 			qcc->task->expire = tick_add_ifset(now_ms, qcc->timeout);
-			task_queue(qcc->task);
-			goto leave;
 		}
-
-		if ((!LIST_ISEMPTY(&qcc->opening_list) || unlikely(!qcc->largest_bidi_r)) &&
-		    qcc->app_st < QCC_APP_ST_SHUT) {
+		else if ((!LIST_ISEMPTY(&qcc->opening_list) || unlikely(!qcc->largest_bidi_r)) &&
+		         qcc->app_st < QCC_APP_ST_SHUT) {
 			int timeout = px->timeout.httpreq;
 			struct qcs *qcs = NULL;
 			int base_time;
@@ -360,41 +357,40 @@ static void qcc_refresh_timeout(struct qcc *qcc)
 				TRACE_DEVEL("at least one request achieved but none currently in progress", QMUX_EV_QCC_WAKE, qcc->conn);
 				qcc->task->expire = tick_add_ifset(qcc->idle_start, timeout);
 			}
+		}
+	}
 
-			/* If proxy soft-stop in progress and connection is
-			 * inactive, close the connection immediately. If a
-			 * close-spread-time is configured, randomly spread the
-			 * timer over a closing window.
+	/* If proxy soft-stop in progress and connection is inactive,
+	 * close the connection immediately. If a close-spread-time is
+	 * configured, randomly spread the timer over a closing window.
+	 */
+	if ((qcc->proxy->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) &&
+	    !(global.tune.options & GTUNE_DISABLE_ACTIVE_CLOSE)) {
+
+		/* Wake timeout task immediately if window already expired. */
+		int remaining_window = tick_isset(global.close_spread_end) ?
+		  tick_remain(now_ms, global.close_spread_end) : 0;
+
+		TRACE_DEVEL("proxy disabled, prepare connection soft-stop", QMUX_EV_QCC_WAKE, qcc->conn);
+		if (remaining_window) {
+			/* We don't need to reset the expire if it would
+			 * already happen before the close window end.
 			 */
-			if ((qcc->proxy->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) &&
-			    !(global.tune.options & GTUNE_DISABLE_ACTIVE_CLOSE)) {
-
-				/* Wake timeout task immediately if window already expired. */
-				int remaining_window = tick_isset(global.close_spread_end) ?
-				  tick_remain(now_ms, global.close_spread_end) : 0;
-
-				TRACE_DEVEL("proxy disabled, prepare connection soft-stop", QMUX_EV_QCC_WAKE, qcc->conn);
-				if (remaining_window) {
-					/* We don't need to reset the expire if it would
-					 * already happen before the close window end.
-					 */
-					if (!tick_isset(qcc->task->expire) ||
-					    tick_is_le(global.close_spread_end, qcc->task->expire)) {
-						/* Set an expire value shorter than the current value
-						 * because the close spread window end comes earlier.
-						 */
-						qcc->task->expire = tick_add(now_ms,
-						                             statistical_prng_range(remaining_window));
-					}
-				}
-				else {
-					/* We are past the soft close window end, wake the timeout
-					 * task up immediately.
-					 */
-					qcc->task->expire = tick_add(now_ms, 0);
-					task_wakeup(qcc->task, TASK_WOKEN_TIMER);
-				}
+			if (!tick_isset(qcc->task->expire) ||
+			    tick_is_le(global.close_spread_end, qcc->task->expire)) {
+				/* Set an expire value shorter than the current value
+				 * because the close spread window end comes earlier.
+				 */
+				qcc->task->expire = tick_add(now_ms,
+				                             statistical_prng_range(remaining_window));
 			}
+		}
+		else {
+			/* We are past the soft close window end, wake the timeout
+			 * task up immediately.
+			 */
+			qcc->task->expire = tick_add(now_ms, 0);
+			task_wakeup(qcc->task, TASK_WOKEN_TIMER);
 		}
 	}
 
@@ -1857,6 +1853,14 @@ int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
 		offset = qcs->rx.offset;
 	}
 
+	if (len && (qcc->flags & QC_CF_WAIT_HS)) {
+		if (!(qcc->conn->flags & CO_FL_EARLY_DATA)) {
+			/* Ensure 'Early-data: 1' will be set on the request. */
+			TRACE_PROTO("received early data", QMUX_EV_QCC_RECV|QMUX_EV_QCS_RECV, qcc->conn, qcs);
+			qcc->conn->flags |= CO_FL_EARLY_DATA;
+		}
+	}
+
 	left = len;
 	while (left) {
 		struct qc_stream_rxbuf *buf;
@@ -3126,10 +3130,10 @@ static void qcc_shutdown(struct qcc *qcc)
 	TRACE_LEAVE(QMUX_EV_QCC_END, qcc->conn);
 }
 
-/* Loop through all qcs from <qcc>. Report error on stream endpoint if
- * connection on error and wake them.
+/* Loop through all qcs from <qcc> and wake their associated data layer if
+ * still active. Also report error on it if connection is already in error.
  */
-static int qcc_wake_some_streams(struct qcc *qcc)
+static void qcc_wake_streams(struct qcc *qcc)
 {
 	struct qcs *qcs;
 	struct eb64_node *node;
@@ -3146,11 +3150,10 @@ static int qcc_wake_some_streams(struct qcc *qcc)
 		if (qcc->flags & (QC_CF_ERR_CONN|QC_CF_ERRL)) {
 			TRACE_POINT(QMUX_EV_QCC_WAKE, qcc->conn, qcs);
 			se_fl_set_error(qcs->sd);
-			qcs_alert(qcs);
 		}
-	}
 
-	return 0;
+		qcs_alert(qcs);
+	}
 }
 
 /* Conduct operations which should be made for <qcc> connection after
@@ -3205,7 +3208,7 @@ static int qcc_io_process(struct qcc *qcc)
 
 	/* Report error if set on stream endpoint layer. */
 	if (qcc->flags & (QC_CF_ERR_CONN|QC_CF_ERRL))
-		qcc_wake_some_streams(qcc);
+		qcc_wake_streams(qcc);
 
  out:
 	if (qcc_is_dead(qcc))
@@ -3275,8 +3278,6 @@ static void qcc_release(struct qcc *qcc)
 	pool_free(pool_head_qcc, qcc);
 
 	if (conn) {
-		LIST_DEL_INIT(&conn->stopping_list);
-
 		conn->mux = NULL;
 		conn->ctx = NULL;
 
@@ -3584,7 +3585,7 @@ static int qmux_init(struct connection *conn, struct proxy *prx,
 		conn->ctx = NULL;
 	}
 
-	TRACE_DEVEL("leaving on error", QMUX_EV_QCC_NEW, conn);
+	TRACE_DEVEL("leaving on error", QMUX_EV_QCC_NEW, qcc ? conn : NULL);
 	return -1;
 }
 
@@ -3731,9 +3732,6 @@ static size_t qmux_strm_snd_buf(struct stconn *sc, struct buffer *buf,
 
 	TRACE_ENTER(QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
 
-	/* Stream must not be woken up if already waiting for conn buffer. */
-	BUG_ON(LIST_INLIST(&qcs->el_buf));
-
 	/* Sending forbidden if QCS is locally closed (FIN or RESET_STREAM sent). */
 	BUG_ON(qcs_is_close_local(qcs) || (qcs->flags & QC_SF_TO_RESET));
 
@@ -3744,6 +3742,11 @@ static size_t qmux_strm_snd_buf(struct stconn *sc, struct buffer *buf,
 	if (qcs->qcc->flags & (QC_CF_ERR_CONN|QC_CF_ERRL)) {
 		se_fl_set(qcs->sd, SE_FL_ERROR);
 		TRACE_DEVEL("connection in error", QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
+		goto end;
+	}
+
+	if (LIST_INLIST(&qcs->el_buf)) {
+		TRACE_DEVEL("leaving on no buf avail", QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
 		goto end;
 	}
 
@@ -3797,9 +3800,6 @@ static size_t qmux_strm_nego_ff(struct stconn *sc, struct buffer *input,
 
 	TRACE_ENTER(QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
 
-	/* Stream must not be woken up if already waiting for conn buffer. */
-	BUG_ON(LIST_INLIST(&qcs->el_buf));
-
 	/* Sending forbidden if QCS is locally closed (FIN or RESET_STREAM sent). */
 	BUG_ON(qcs_is_close_local(qcs) || (qcs->flags & QC_SF_TO_RESET));
 
@@ -3818,6 +3818,12 @@ static size_t qmux_strm_nego_ff(struct stconn *sc, struct buffer *input,
 		 */
 		TRACE_DEVEL("connection in error", QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
 		qcs->sd->iobuf.flags |= IOBUF_FL_NO_FF;
+		goto end;
+	}
+
+	if (LIST_INLIST(&qcs->el_buf)) {
+		TRACE_DEVEL("leaving on no buf avail", QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
+		qcs->sd->iobuf.flags |= IOBUF_FL_FF_BLOCKED;
 		goto end;
 	}
 
@@ -3955,7 +3961,11 @@ static int qmux_wake(struct connection *conn)
 		goto release;
 	}
 
-	qcc_wake_some_streams(qcc);
+	/* Wake all streams, unless an error is set as qcc_io_process() has
+	 * already woken them in this case.
+	 */
+	if (!(qcc->flags & (QC_CF_ERR_CONN|QC_CF_ERRL)))
+		qcc_wake_streams(qcc);
 
 	qcc_refresh_timeout(qcc);
 

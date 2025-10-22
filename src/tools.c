@@ -4689,6 +4689,8 @@ char *indent_msg(char **out, int level)
 
 	needed = 1 + level * (lf + 1) + len + 1;
 	p = ret = malloc(needed);
+	if (unlikely(!ret))
+		return NULL;
 	in = *out;
 
 	/* skip initial LFs */
@@ -5697,7 +5699,9 @@ const void *resolve_sym_name(struct buffer *buf, const char *pfx, const void *ad
 	 * may have a close match. Otherwise we report an offset relative to main.
 	 */
 	if (best_idx >= 0) {
-		chunk_appendf(buf, "%s+%#lx", fcts[best_idx].name, (long)best_dist);
+		chunk_appendf(buf, "%s", fcts[best_idx].name);
+		if (best_dist)
+			chunk_appendf(buf, "+%#lx", (long)best_dist);
 		return best_dist == 0 ? addr : NULL;
 	}
 	else if ((void*)addr < (void*)main)

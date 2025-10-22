@@ -1533,9 +1533,11 @@ struct pat_ref *pat_ref_lookup(const char *reference)
 {
 	struct pat_ref *ref;
 
-	/* Skip file@ prefix, it is the default case. Can be mixed with ref omitting the prefix */
+	/* Skip file@ or opt@ prefix, it is the default case. Can be mixed with ref omitting the prefix */
 	if (strlen(reference) > 5 && strncmp(reference, "file@", 5) == 0)
 		reference += 5;
+	else if (strlen(reference) > 4 && strncmp(reference, "opt@", 4) == 0)
+		reference += 4;
 
 	list_for_each_entry(ref, &pattern_reference, list)
 		if (ref->reference && strcmp(reference, ref->reference) == 0)
@@ -1797,13 +1799,15 @@ static int pat_ref_set_from_node(struct pat_ref *ref, struct ebmb_node *node, co
 		char *tmp_err = NULL;
 
 		elt = ebmb_entry(node, struct pat_ref_elt, node);
+		node = ebmb_next_dup(node);
+
 		if (first)
 			gen = elt->gen_id;
 		else if (elt->gen_id != gen) {
 			/* only consider duplicate elements from the same gen! */
 			continue;
 		}
-		node = ebmb_next_dup(node);
+
 		if (!pat_ref_set_elt(ref, elt, value, &tmp_err)) {
 			if (err)
 				*err = tmp_err;
@@ -2510,6 +2514,8 @@ int pattern_read_from_file(struct pattern_head *head, unsigned int refflags,
 					return 0;
 			}
 		}
+		else if ((ref->flags & PAT_REF_ID) && load_smp)
+			ref->flags |= PAT_REF_SMP;
 	}
 	else {
 		/* The reference already exists, check the map compatibility. */

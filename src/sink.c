@@ -298,11 +298,13 @@ int sink_announce_dropped(struct sink *sink, struct log_header hdr)
 	 * another thread is already on them and we can just pass and
 	 * count another drop (hence add 2).
 	 */
-	dropped = HA_ATOMIC_FETCH_OR(&sink->ctx.dropped, 1);
-	if (dropped & 1) {
-		/* another thread was already on it */
-		goto leave;
-	}
+	dropped = HA_ATOMIC_LOAD(&sink->ctx.dropped);
+	do {
+		if (dropped & 1) {
+			/* another thread was already on it */
+			goto leave;
+		}
+	} while (!_HA_ATOMIC_CAS(&sink->ctx.dropped, &dropped, dropped | 1));
 
 	last_dropped = 0;
 	dropped >>= 1;
@@ -688,7 +690,7 @@ static struct task *process_sink_forward(struct task * task, void *context, unsi
 			 * establishment attempt per second.
 			 */
 			if (!sft->appctx) {
-				uint tempo = sft->last_conn + MS_TO_TICKS(1000);
+				int tempo = tick_add(sft->last_conn, MS_TO_TICKS(1000));
 
 				if (sft->last_conn == TICK_ETERNITY || tick_is_expired(tempo, now_ms))
 					sft->appctx = sink_forward_session_create(sink, sft);

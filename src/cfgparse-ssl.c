@@ -789,7 +789,7 @@ static int bind_parse_ciphersuites(char **args, int cur_arg, struct proxy *px, s
 static int bind_parse_crt(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
 	char path[MAXPATHLEN];
-	int default_crt = *args[cur_arg] == 'd' ? 1 : 0;
+	int default_crt = *args[cur_arg] == 'd' ? CKCH_INST_EXPL_DEFAULT : CKCH_INST_NO_DEFAULT;
 
 	if (!*args[cur_arg + 1]) {
 		memprintf(err, "'%s' : missing certificate location", args[cur_arg]);
@@ -2289,6 +2289,7 @@ error:
 	ha_free(&ckch_conf);
 	ssl_sock_free_ssl_conf(ssl_conf);
 	ha_free(&ssl_conf);
+	ha_free(&cfg_crt_node->filename);
 	ha_free(&cfg_crt_node);
 	return -1;
 }
@@ -2344,6 +2345,7 @@ static int post_section_frontend_crt_init()
 		LIST_DELETE(&n->list);
 		/* n->ssl_conf is reused so we don't free them here */
 		free(n->ckch_conf);
+		free(n->filename);
 		free(n);
 	}
 
@@ -2355,19 +2357,18 @@ static int post_section_frontend_crt_init()
 			goto error;
 		}
 
-		/* look for "ssl" bind lines without any crt nor crt-line */
+		/* look for "ssl" bind lines */
 		list_for_each_entry(b, &curproxy->conf.bind, by_fe) {
 			if (b->options & BC_O_USE_SSL) {
-				if (eb_is_empty(&b->sni_ctx) && eb_is_empty(&b->sni_w_ctx)) {
-					err_code |= ssl_sock_load_cert_list_file(crtlist_name, 0, b, curproxy, &err);
-					if (err_code & ERR_CODE)
-						goto error;
-				}
+				err_code |= ssl_sock_load_cert_list_file(crtlist_name, 0, b, curproxy, &err);
+				if (err_code & ERR_CODE)
+					goto error;
 			}
 		}
 	}
 
-	return err_code;
+	goto end;
+
 error:
 
 	if (err)
@@ -2383,9 +2384,11 @@ error:
 		ha_free(&n);
 	}
 
-	ha_free(&crtlist_name);
 	crtlist_entry_free(entry);
 	crtlist_free(newlist);
+
+end:
+	ha_free(&crtlist_name);
 	return err_code;
 }
 

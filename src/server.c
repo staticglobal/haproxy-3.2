@@ -51,7 +51,7 @@
 #include <haproxy/xxhash.h>
 #include <haproxy/event_hdl.h>
 
-
+static inline int _srv_parse_exprs(struct server *srv, struct proxy *px, char **errmsg);
 static void srv_update_status(struct server *s, int type, int cause);
 static int srv_apply_lastaddr(struct server *srv, int *err_code);
 static void srv_cleanup_connections(struct server *srv);
@@ -2758,16 +2758,29 @@ static void srv_ssl_settings_cpy(struct server *srv, const struct server *src)
  *
  * Must be called with the server lock held.
  */
-void srv_set_ssl(struct server *s, int use_ssl)
+int srv_set_ssl(struct server *s, int use_ssl)
 {
 	if (s->use_ssl == use_ssl)
-		return;
+		return 0;
 
 	s->use_ssl = use_ssl;
-	if (s->use_ssl)
+	if (s->use_ssl) {
+		if (_srv_parse_exprs(s, s->proxy, NULL))
+			return -1;
 		s->xprt = xprt_get(XPRT_SSL);
-	else
+	}
+	else {
+		if (s->sni_expr && s->pool_conn_name && strcmp(s->sni_expr, s->pool_conn_name) == 0) {
+			release_sample_expr(s->pool_conn_name_expr);
+			s->pool_conn_name_expr = NULL;
+		}
 		s->xprt = xprt_get(XPRT_RAW);
+	}
+	/* Check if we must rely on the server XPRT for the health-check */
+	if (!s->check.port && !is_addr(&s->check.addr) && !s->check.use_ssl)
+		s->check.xprt = s->xprt;
+
+	return 0;
 }
 
 #endif /* USE_OPENSSL */
@@ -2889,8 +2902,15 @@ void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl
 	srv->check.use_ssl            = src->check.use_ssl;
 	srv->check.port               = src->check.port;
 	srv->check.sni                = src->check.sni;
-	srv->check.alpn_str           = src->check.alpn_str;
-	srv->check.alpn_len           = src->check.alpn_len;
+	if (src->check.alpn_str) {
+		srv->check.alpn_str = malloc(src->check.alpn_len);
+		if (srv->check.alpn_str) {
+			memcpy(srv->check.alpn_str, src->check.alpn_str,
+			       src->check.alpn_len);
+			srv->check.alpn_len = src->check.alpn_len;
+		}
+	}
+
 	if (!(srv->flags & SRV_F_RHTTP))
 		srv->check.reuse_pool = src->check.reuse_pool;
 	if (src->check.pool_conn_name)
@@ -3260,6 +3280,41 @@ static inline void _srv_parse_set_id_from_prefix(struct server *srv,
 	srv->id = strdup(trash.area);
 }
 
+/* Parse the sni and pool-conn-name expressions. Returns 0 on success and non-zero on
+ * error. */
+static inline int _srv_parse_exprs(struct server *srv, struct proxy *px, char **errmsg)
+{
+	int ret = 0;
+
+	if (srv->use_ssl == 1) {
+		/* Use sni as fallback if pool_conn_name isn't set, but only if
+		 * the server is configured to use SSL */
+		if (!srv->pool_conn_name && srv->sni_expr) {
+			srv->pool_conn_name = strdup(srv->sni_expr);
+			if (!srv->pool_conn_name) {
+				memprintf(errmsg, "cannot duplicate sni expression (out of memory)");
+				ret = ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+		}
+	}
+
+	if (srv->sni_expr && !srv->ssl_ctx.sni) {
+		ret = parse_srv_expr(srv->sni_expr, &srv->ssl_ctx.sni, px, errmsg);
+		if (ret)
+			goto out;
+	}
+
+	if (srv->pool_conn_name && !srv->pool_conn_name_expr) {
+		ret = parse_srv_expr(srv->pool_conn_name, &srv->pool_conn_name_expr, px, errmsg);
+		if (ret)
+			goto out;
+	}
+
+  out:
+	return ret;
+}
+
 /* Initialize as much as possible servers from <srv> server template.
  * Note that a server template is a special server with
  * a few different parameters than a server which has
@@ -3293,24 +3348,8 @@ static int _srv_parse_tmpl_init(struct server *srv, struct proxy *px)
 		srv_settings_cpy(newsrv, srv, 1);
 		srv_prepare_for_resolution(newsrv, srv->hostname);
 
-		/* Use sni as fallback if pool_conn_name isn't set */
-		if (!newsrv->pool_conn_name && newsrv->sni_expr) {
-			newsrv->pool_conn_name = strdup(newsrv->sni_expr);
-			if (!newsrv->pool_conn_name)
-				goto err;
-		}
-
-		if (newsrv->pool_conn_name) {
-			newsrv->pool_conn_name_expr = _parse_srv_expr(srv->pool_conn_name, &px->conf.args, NULL, 0, NULL);
-			if (!newsrv->pool_conn_name_expr)
-				goto err;
-		}
-
-		if (newsrv->sni_expr) {
-			newsrv->ssl_ctx.sni = _parse_srv_expr(srv->sni_expr, &px->conf.args, NULL, 0, NULL);
-			if (!newsrv->ssl_ctx.sni)
-				goto err;
-		}
+	        if (_srv_parse_exprs(newsrv, px, NULL))
+			goto err;
 
 		/* append to list of servers available to receive an hostname */
 		if (newsrv->srvrq)
@@ -3730,27 +3769,9 @@ static int _srv_parse_finalize(char **args, int cur_arg,
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	if ((ret = parse_srv_expr(srv->sni_expr, &srv->ssl_ctx.sni, px, &errmsg))) {
+	if ((ret = _srv_parse_exprs(srv, px, &errmsg))) {
 		if (errmsg) {
-			ha_alert("error detected while parsing sni expression : %s.\n", errmsg);
-			free(errmsg);
-		}
-		return ret;
-	}
-
-	/* Use sni as fallback if pool_conn_name isn't set */
-	if (!srv->pool_conn_name && srv->sni_expr) {
-		srv->pool_conn_name = strdup(srv->sni_expr);
-		if (!srv->pool_conn_name) {
-			ha_alert("out of memory\n");
-			return ERR_ALERT | ERR_FATAL;
-		}
-	}
-
-	if ((ret = parse_srv_expr(srv->pool_conn_name, &srv->pool_conn_name_expr,
-	                          px, &errmsg))) {
-		if (errmsg) {
-			ha_alert("error detected while parsing pool-conn-name expression : %s.\n", errmsg);
+			ha_alert("error detected while parsing sni or pool-conn-name expressions : %s.\n", errmsg);
 			free(errmsg);
 		}
 		return ret;
@@ -4453,6 +4474,10 @@ out:
 			s->check.addr = sk;
 		if (port)
 			s->check.port = new_port;
+
+		/* Fallback to raw XPRT for the health-check */
+		if (!s->check.use_ssl)
+			s->check.xprt = xprt_get(XPRT_RAW);
 	}
 	return NULL;
 }
@@ -5425,6 +5450,8 @@ static int cli_parse_set_server(char **args, char *payload, struct appctx *appct
 	}
 	else if (strcmp(args[3], "ssl") == 0) {
 #ifdef USE_OPENSSL
+		char *err = NULL;
+
 		if (sv->flags & SRV_F_DYNAMIC) {
 			cli_err(appctx, "'set server <srv> ssl' not supported on dynamic servers\n");
 			goto out;
@@ -5438,9 +5465,15 @@ static int cli_parse_set_server(char **args, char *payload, struct appctx *appct
 
 		HA_SPIN_LOCK(SERVER_LOCK, &sv->lock);
 		if (strcmp(args[4], "on") == 0) {
-			srv_set_ssl(sv, 1);
+			if (srv_set_ssl(sv, 1)) {
+				cli_dynerr(appctx, memprintf(&err, "failed to enable ssl for server %s.\n", args[2]));
+				goto out;
+			}
 		} else if (strcmp(args[4], "off") == 0) {
-			srv_set_ssl(sv, 0);
+			if (srv_set_ssl(sv, 0)) {
+				cli_dynerr(appctx, memprintf(&err, "failed to disable ssl for server %s.\n", args[2]));
+				goto out;
+			}
 		} else {
 			HA_SPIN_UNLOCK(SERVER_LOCK, &sv->lock);
 			cli_err(appctx, "'set server <srv> ssl' expects 'on' or 'off'.\n");
@@ -5789,6 +5822,12 @@ static int init_srv_requeue(struct server *srv)
 	srv->requeue_tasklet = t;
 	t->process = server_requeue;
 	t->context = srv;
+	/*
+	 * Run the tasklet once, in the very unlikely event the server
+	 * failed to queue itself when brought up, which could happen if
+	 * a memory allocation failed.
+	 */
+	tasklet_wakeup(t);
 	return ERR_NONE;
 }
 REGISTER_POST_SERVER_CHECK(init_srv_requeue);
@@ -6325,10 +6364,11 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 
 			/* Only idle connections should be present if srv_check_for_deletion() is true. */
 			BUG_ON(!(conn->flags & CO_FL_SESS_IDLE));
+			--((struct session *)conn->owner)->idle_conns;
 
 			LIST_DEL_INIT(&conn->sess_el);
 			conn->owner = NULL;
-			conn->flags &= ~CO_FL_SESS_IDLE;
+
 			if (sess_conns->tid != tid) {
 				if (conn->mux && conn->mux->takeover)
 					conn->mux->takeover(conn, sess_conns->tid, 1);

@@ -924,7 +924,6 @@ static void h2c_update_timeout(struct h2c *h2c)
 					else if (h2c->flags & H2_CF_IDL_PING_SENT) {
 						/* timer other than ping selected, remove ping flag to allow GOAWAY on expiration. */
 						h2c->flags &= ~H2_CF_IDL_PING_SENT;
-						ABORT_NOW();
 					}
 				}
 			}
@@ -1013,7 +1012,7 @@ h2c_is_dead(const struct h2c *h2c)
  */
 static inline int h2_recv_allowed(const struct h2c *h2c)
 {
-	if ((h2c->flags & (H2_CF_RCVD_SHUT|H2_CF_ERROR)) || h2c->st0 >= H2_CS_ERROR)
+	if (h2c->flags & (H2_CF_RCVD_SHUT|H2_CF_ERROR))
 		return 0;
 
 	if ((h2c->wait_event.events & SUB_RETRY_RECV))
@@ -1517,9 +1516,6 @@ static void h2_release(struct h2c *h2c)
 	pool_free(pool_head_h2c, h2c);
 
 	if (conn) {
-		if (!conn_is_back(conn))
-			LIST_DEL_INIT(&conn->stopping_list);
-
 		conn->mux = NULL;
 		conn->ctx = NULL;
 		TRACE_DEVEL("freeing conn", H2_EV_H2C_END, conn);
@@ -4804,7 +4800,7 @@ static int h2_send(struct h2c *h2c)
 		TRACE_DEVEL("leaving on error", H2_EV_H2C_SEND, h2c->conn);
 		if (h2c->flags & H2_CF_END_REACHED)
 			h2c->flags |= H2_CF_ERROR;
-		b_reset(br_tail(h2c->mbuf));
+		h2_release_mbuf(h2c);
 		h2c->idle_start = now_ms;
 		return 1;
 	}
@@ -4903,7 +4899,7 @@ static int h2_send(struct h2c *h2c)
 		h2c_report_term_evt(h2c, muxc_tevt_type_snd_err);
 		if (h2c->flags & H2_CF_END_REACHED)
 			h2c->flags |= H2_CF_ERROR;
-		b_reset(br_tail(h2c->mbuf));
+		h2_release_mbuf(h2c);
 	}
 
 	/* We're not full anymore, so we can wake any task that are waiting
@@ -5014,6 +5010,7 @@ static int h2_process(struct h2c *h2c)
 {
 	struct connection *conn = h2c->conn;
 	int extra_reads = MIN(MAX(bl_avail(h2c->shared_rx_bufs), 1) - 1, 12);
+	int was_blocked = 0;
 
 	TRACE_ENTER(H2_EV_H2C_WAKE, conn);
 
@@ -5045,9 +5042,12 @@ static int h2_process(struct h2c *h2c)
 		if (h2c->glitches != prev_glitches && !(h2c->flags & H2_CF_IS_BACK))
 			session_add_glitch_ctr(h2c->conn->owner, h2c->glitches - prev_glitches);
 
-		if (h2c->st0 >= H2_CS_ERROR || (h2c->flags & H2_CF_ERROR))
+		if (h2c->st0 >= H2_CS_ERROR || (h2c->flags & H2_CF_ERROR)) {
 			b_reset(&h2c->dbuf);
+			h2c->flags &= ~H2_CF_DEM_DFULL;
+		}
 	}
+	was_blocked |= !!(h2c->flags & H2_CF_DEM_MROOM);
 	h2_send(h2c);
 
 	if (unlikely(h2c->proxy->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) && !(h2c->flags & H2_CF_IS_BACK)) {
@@ -5140,7 +5140,13 @@ static int h2_process(struct h2c *h2c)
 		h2_release_mbuf(h2c);
 
 	h2c_update_timeout(h2c);
+
+	was_blocked |= !!(h2c->flags & H2_CF_DEM_MROOM);
 	h2_send(h2c);
+
+	if (was_blocked && !(h2c->flags & H2_CF_DEM_MROOM))
+		h2c_restart_reading(h2c, 1);
+
 	TRACE_LEAVE(H2_EV_H2C_WAKE, conn);
 	return 0;
 }
@@ -7902,7 +7908,8 @@ static size_t h2_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, in
 	}
 
 	/* RST are sent similarly to frame acks */
-	if (h2s->st == H2_SS_ERROR || h2s->flags & H2_SF_RST_RCVD) {
+	if (h2s->st == H2_SS_ERROR || h2s->flags & H2_SF_RST_RCVD ||
+	    ((h2s->h2c->flags & H2_CF_END_REACHED) && (h2s->flags & (H2_SF_BLK_SFCTL|H2_SF_BLK_MFCTL)))) {
 		TRACE_DEVEL("reporting RST/error to the app-layer stream", H2_EV_H2S_SEND|H2_EV_H2S_ERR|H2_EV_STRM_ERR, h2s->h2c->conn, h2s);
 		se_fl_set_error(h2s->sd);
 		se_report_term_evt(h2s->sd, se_tevt_type_snd_err);
@@ -8075,6 +8082,17 @@ static size_t h2_nego_ff(struct stconn *sc, struct buffer *input, size_t count, 
  end:
 	if (h2s->sd->iobuf.flags & IOBUF_FL_FF_BLOCKED)
 		h2s->flags &= ~H2_SF_NOTIFIED;
+
+	/* RST are sent similarly to frame acks */
+	if (h2s->st == H2_SS_ERROR || h2s->flags & H2_SF_RST_RCVD ||
+	    ((h2c->flags & H2_CF_END_REACHED) && (h2s->flags & (H2_SF_BLK_SFCTL|H2_SF_BLK_MFCTL)))) {
+		TRACE_DEVEL("reporting RST/error to the app-layer stream", H2_EV_H2S_SEND|H2_EV_H2S_ERR|H2_EV_STRM_ERR, h2s->h2c->conn, h2s);
+		se_fl_set_error(h2s->sd);
+		se_report_term_evt(h2s->sd, se_tevt_type_snd_err);
+		if (h2s_send_rst_stream(h2s->h2c, h2s) > 0)
+			h2s_close(h2s);
+	}
+
 	TRACE_LEAVE(H2_EV_H2S_SEND|H2_EV_STRM_SEND, h2s->h2c->conn, h2s);
 	return ret;
 }

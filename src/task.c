@@ -43,7 +43,9 @@ DECLARE_POOL(pool_head_notification, "notification", sizeof(struct notification)
 __decl_aligned_rwlock(wq_lock);
 
 /* used to detect if the scheduler looks stuck (for warnings) */
-static THREAD_LOCAL int sched_stuck;
+static struct {
+	int sched_stuck ALIGNED(64);
+} sched_ctx[MAX_THREADS];
 
 /* Flags the task <t> for immediate destruction and puts it into its first
  * thread's shared tasklet list if not yet queued/running. This will bypass
@@ -674,7 +676,7 @@ unsigned int run_tasks_from_lists(unsigned int budgets[])
 		done++;
 	next:
 		th_ctx->current = NULL;
-		sched_stuck = 0; // scheduler is not stuck (don't warn)
+		sched_ctx[tid].sched_stuck = 0; // scheduler is not stuck (don't warn)
 		__ha_barrier_store();
 
 		/* stats are only registered for non-zero wake dates */
@@ -682,6 +684,7 @@ unsigned int run_tasks_from_lists(unsigned int budgets[])
 			HA_ATOMIC_ADD(&profile_entry->cpu_time, (uint32_t)(now_mono_time() - th_ctx->sched_call_date));
 	}
 	th_ctx->current_queue = -1;
+	th_ctx->sched_wake_date = TICK_ETERNITY;
 
 	return done;
 }
@@ -897,18 +900,13 @@ void process_runnable_tasks()
 		activity[tid].long_rq++;
 }
 
-/* Pings the scheduler to verify that tasks continue running.
- * Returns 1 if the scheduler made progress since last call,
- * 0 if it looks stuck.
+/* Pings the scheduler to verify that tasks continue running for thread <thr>.
+ * Returns 1 if the scheduler made progress since last call, 0 if it looks
+ * stuck. It marks it as stuck for next visit.
  */
-int is_sched_alive(void)
+int is_sched_alive(int thr)
 {
-	if (sched_stuck)
-		return 0;
-
-	/* next time we'll know if any progress was made */
-	sched_stuck = 1;
-	return 1;
+	return !HA_ATOMIC_XCHG(&sched_ctx[thr].sched_stuck, 1);
 }
 
 /*

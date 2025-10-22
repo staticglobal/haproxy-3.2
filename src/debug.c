@@ -103,6 +103,7 @@ struct post_mortem {
 	char post_mortem_magic[32];     // "POST-MORTEM STARTS HERE+7654321\0"
 	struct {
 		struct utsname utsname; // OS name+ver+arch+hostname
+		char distro[64];	// Distro name and version from os-release file if exists
 		char hw_vendor[64];     // hardware/hypervisor vendor when known
 		char hw_family[64];     // hardware/hypervisor product family when known
 		char hw_model[64];      // hardware/hypervisor product/model when known
@@ -320,7 +321,7 @@ void ha_thread_dump_one(struct buffer *buf, int is_caller)
 
 	chunk_appendf(buf,
 	              "%c%cThread %-2u: id=0x%llx act=%d glob=%d wq=%d rq=%d tl=%d tlsz=%d rqsz=%d\n"
-	              "     %2u/%-2u   stuck=%d prof=%d",
+	              "     %2u/%-2u   loops=%u ctxsw=%u stuck=%d prof=%d",
 	              (is_caller) ? '*' : ' ', stuck ? '>' : ' ', tid + 1,
 		      ha_get_pthread_id(tid),
 		      thread_has_tasks(),
@@ -334,6 +335,7 @@ void ha_thread_dump_one(struct buffer *buf, int is_caller)
 	              th_ctx->tasks_in_list,
 	              th_ctx->rq_total,
 		      ti->tgid, ti->ltid + 1,
+		      activity[tid].loops, activity[tid].ctxsw,
 	              stuck,
 	              !!(th_ctx->flags & TH_FL_TASK_PROFILING));
 
@@ -346,6 +348,18 @@ void ha_thread_dump_one(struct buffer *buf, int is_caller)
 
 	chunk_appendf(buf, "\n");
 	chunk_appendf(buf, "             cpu_ns: poll=%llu now=%llu diff=%llu\n", p, n, n-p);
+
+	/* also try to indicate for how long we've entered the current task.
+	 * Note that the task's wake date only contains the 32 lower bits of
+	 * the current time.
+	 */
+	if (th_ctx->current && tick_isset(th_ctx->sched_wake_date)) {
+		unsigned long long now = now_mono_time();
+
+		chunk_appendf(buf, "             current call: wake=%u ns ago, call=%llu ns ago\n",
+			      (uint)(now - th_ctx->sched_wake_date),
+			      (now - th_ctx->sched_call_date));
+	}
 
 	/* this is the end of what we can dump from outside the current thread */
 
@@ -688,6 +702,8 @@ static int debug_parse_cli_show_dev(char **args, char *payload, struct appctx *a
 		chunk_appendf(&trash, "  OS architecture: %s\n", post_mortem.platform.utsname.machine);
 	if (*post_mortem.platform.utsname.nodename)
 		chunk_appendf(&trash, "  node name: %s\n", HA_ANON_CLI(post_mortem.platform.utsname.nodename));
+	if (*post_mortem.platform.distro)
+		chunk_appendf(&trash, "  distro pretty name: %s\n", HA_ANON_CLI(post_mortem.platform.distro));
 
 	chunk_appendf(&trash, "Process info\n");
 	chunk_appendf(&trash, "  pid: %d\n", post_mortem.process.pid);
@@ -768,7 +784,8 @@ void ha_panic()
 		return;
 	}
 
-	chunk_printf(&trash, "Thread %u is about to kill the process.\n", tid + 1);
+	chunk_printf(&trash, "Thread %u is about to kill the process (pid %d).\n", tid + 1, pid);
+
 	DISGUISE(write(2, trash.area, trash.data));
 
 	for (thr = 0; thr < global.nbthread; thr++) {
@@ -895,7 +912,7 @@ void ha_stuck_warning(void)
 			     "          'global' section of your configuration to avoid this in the future.\n");
 	}
 
-	chunk_appendf(&buf, " => Trying to gracefully recover now.\n");
+	chunk_appendf(&buf, " => Trying to gracefully recover now (pid %d).\n", pid);
 
 	/* Note: it's important to dump the whole buffer at once to avoid
 	 * interleaved outputs from multiple threads dumping in parallel.
@@ -2770,6 +2787,12 @@ static void feed_post_mortem_linux()
 
 static int feed_post_mortem()
 {
+	FILE *file;
+	struct stat statbuf;
+	char line[64];
+	char file_path[32];
+	int line_cnt = 0;
+
 	/* write an easily identifiable magic at the beginning of the struct */
 	strncpy(post_mortem.post_mortem_magic,
 		"POST-MORTEM STARTS HERE+7654321\0",
@@ -2777,6 +2800,49 @@ static int feed_post_mortem()
 	/* kernel type, version and arch */
 	uname(&post_mortem.platform.utsname);
 
+	/* try to find os-release file, this may give the current minor version of
+	 * distro if it was recently updated.
+	 */
+	snprintf(file_path, sizeof(file_path), "%s", "/etc/os-release");
+	if (stat(file_path, &statbuf) != 0) {
+		/* fallback to "/usr/lib/os-release" */
+		snprintf(file_path, sizeof(file_path), "%s", "/usr/lib/os-release");
+		if (stat(file_path, &statbuf) != 0 ) {
+			goto process_info;
+		}
+	}
+
+	/* try open and find the line with distro PRETTY_NAME (name + full version) */
+	if ((file = fopen(file_path, "r")) == NULL) {
+		goto process_info;
+	}
+
+	while ((fgets(line, sizeof(post_mortem.platform.distro), file)) && (line_cnt < MAX_LINES_TO_READ)) {
+		line_cnt++;
+		if (strncmp(line, "PRETTY_NAME=", 12) == 0) {
+			/* cut \n and trim possible quotes */
+			char *start = line + 12;
+			char *newline = strchr(start, '\n');
+
+			if (newline) {
+				*newline = '\0';
+			} else {
+				newline = start + strlen(start);
+			}
+
+			/* trim possible quotes */
+			if (*start == '"')
+				start++;
+			if (newline > start && *(newline - 1) == '"')
+				*(--newline) = '\0';
+
+			strlcpy2(post_mortem.platform.distro, start, sizeof(post_mortem.platform.distro));
+			break;
+		}
+	}
+	fclose(file);
+
+process_info:
 	/* some boot-time info related to the process */
 	post_mortem.process.pid = getpid();
 	post_mortem.process.boot_uid = geteuid();

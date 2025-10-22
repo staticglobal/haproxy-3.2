@@ -467,11 +467,6 @@ void conn_init(struct connection *conn, void *target)
 	conn->target = target;
 	conn->destroy_cb = NULL;
 	conn->proxy_netns = NULL;
-	MT_LIST_INIT(&conn->toremove_list);
-	if (conn_is_back(conn))
-		LIST_INIT(&conn->sess_el);
-	else
-		LIST_INIT(&conn->stopping_list);
 	LIST_INIT(&conn->tlv_list);
 	conn->subs = NULL;
 	conn->src = NULL;
@@ -488,6 +483,10 @@ void conn_init(struct connection *conn, void *target)
  */
 static int conn_backend_init(struct connection *conn)
 {
+	LIST_INIT(&conn->idle_list);
+	LIST_INIT(&conn->sess_el);
+	MT_LIST_INIT(&conn->toremove_list);
+
 	if (!sockaddr_alloc(&conn->dst, 0, 0))
 		return 1;
 
@@ -496,6 +495,12 @@ static int conn_backend_init(struct connection *conn)
 		return 1;
 
 	return 0;
+}
+
+/* Initialize members used only on frontend connections. */
+static void conn_frontend_init(struct connection *conn)
+{
+	LIST_INIT(&conn->stopping_list);
 }
 
 /* Release connection elements reserved for backend side usage. It also takes
@@ -528,6 +533,18 @@ static void conn_backend_deinit(struct connection *conn)
 	pool_free(pool_head_conn_hash_node, conn->hash_node);
 	conn->hash_node = NULL;
 
+	/* Remove from BE purge list. Necessary if conn already scheduled for
+	 * purge but finally freed before by another code path.
+	 */
+	MT_LIST_DELETE(&conn->toremove_list);
+}
+
+/* Ensure <conn> frontend connection is removed from its lists. This must be
+ * performed before freeing or reversing a connection.
+ */
+static void conn_frontend_deinit(struct connection *conn)
+{
+	LIST_DEL_INIT(&conn->stopping_list);
 }
 
 /* Tries to allocate a new connection and initialized its main fields. The
@@ -553,6 +570,9 @@ struct connection *conn_new(void *target)
 			return NULL;
 		}
 	}
+	else {
+		conn_frontend_init(conn);
+	}
 
 	return conn;
 }
@@ -564,14 +584,8 @@ void conn_free(struct connection *conn)
 
 	if (conn_is_back(conn))
 		conn_backend_deinit(conn);
-
-	/* Remove the conn from toremove_list.
-	 *
-	 * This is needed to prevent a double-free in case the connection was
-	 * already scheduled from cleaning but is freed before via another
-	 * call.
-	 */
-	MT_LIST_DELETE(&conn->toremove_list);
+	else
+		conn_frontend_deinit(conn);
 
 	sockaddr_free(&conn->src);
 	sockaddr_free(&conn->dst);
@@ -2931,6 +2945,8 @@ int conn_reverse(struct connection *conn)
 		struct server *srv = objt_server(conn->reverse.target);
 		BUG_ON(!srv);
 
+		conn_frontend_deinit(conn);
+
 		if (conn_backend_init(conn))
 			return 1;
 
@@ -2954,7 +2970,6 @@ int conn_reverse(struct connection *conn)
 		srv_use_conn(srv, conn);
 
 		/* Free the session after detaching the connection from it. */
-		session_unown_conn(sess, conn);
 		sess->origin = NULL;
 		session_free(sess);
 		conn_set_owner(conn, NULL, NULL);
@@ -2967,6 +2982,7 @@ int conn_reverse(struct connection *conn)
 
 		conn_backend_deinit(conn);
 
+		conn_frontend_init(conn);
 		conn->target = &l->obj_type;
 		conn->flags |= CO_FL_ACT_REVERSING;
 		task_wakeup(l->rx.rhttp.task, TASK_WOKEN_RES);

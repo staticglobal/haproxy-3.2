@@ -87,7 +87,7 @@
 #include <haproxy/istbuf.h>
 #include <haproxy/ssl_ocsp.h>
 #include <haproxy/trace.h>
-#include <haproxy/ssl_trace-t.h>
+#include <haproxy/ssl_trace.h>
 
 
 /* ***** READ THIS before adding code here! *****
@@ -1317,18 +1317,28 @@ static int ssl_sock_load_ocsp(const char *path, SSL_CTX *ctx, struct ckch_store 
 		 * prior to the activation of the ocsp auto update and in such a
 		 * case we must "force" insertion in the auto update tree.
 		 */
+		HA_SPIN_LOCK(OCSP_LOCK, &ocsp_tree_lock);
 		if (iocsp->next_update.node.leaf_p == NULL) {
-			ssl_ocsp_update_insert(iocsp);
-			/* If we are during init the update task is not
-			 * scheduled yet so a wakeup won't do anything.
-			 * Otherwise, if the OCSP was added through the CLI, we
-			 * wake the task up to manage the case of a new entry
-			 * that needs to be updated before the previous first
-			 * entry.
+			/* We might be facing an entry that is currently being
+			 * updated, which can take some time (especially if the
+			 * ocsp responder is unreachable).
+			 * The entry will be reinserted by the update task, it
+			 * mustn't be reinserted here.
 			 */
-			if (ocsp_update_task)
-				task_wakeup(ocsp_update_task, TASK_WOKEN_MSG);
+			if (!iocsp->updating) {
+				__ssl_ocsp_update_insert_unlocked(iocsp);
+				/* If we are during init the update task is not
+				 * scheduled yet so a wakeup won't do anything.
+				 * Otherwise, if the OCSP was added through the CLI, we
+				 * wake the task up to manage the case of a new entry
+				 * that needs to be updated before the previous first
+				 * entry.
+				 */
+				if (ocsp_update_task)
+					task_wakeup(ocsp_update_task, TASK_WOKEN_MSG);
+			}
 		}
+		HA_SPIN_UNLOCK(OCSP_LOCK, &ocsp_tree_lock);
 	}
 
 out:
@@ -1728,9 +1738,21 @@ static void ssl_sock_parse_clienthello(struct connection *conn, int write_p, int
 	if (msg + rec_len > end || msg + rec_len < msg)
 		return;
 
-	capture = pool_zalloc(pool_head_ssl_capture);
+	/* BEWARE below! one could believe that there's a single client hello
+	 * per connection, but captures show that a second one may happen,
+	 * logged as "Change Cipher Client Hello" in wireshark, that can be
+	 * triggered for example by the presence of "curves" or "ecdhe" on the
+	 * "bind" line. The core below MUST NOT assume that it's called for the
+	 * first time and must first verify if the capture field had already
+	 * been allocated before trying to allocate a new one.
+	 */
+	capture = SSL_get_ex_data(ssl, ssl_capture_ptr_index);
+	if (!capture)
+		capture = pool_alloc(pool_head_ssl_capture);
 	if (!capture)
 		return;
+
+	memset(capture, 0, sizeof(*capture));
 	/* Compute the xxh64 of the ciphersuite. */
 	capture->xxh64 = XXH64(msg, rec_len, 0);
 
@@ -3001,7 +3023,7 @@ int ckch_inst_new_load_store(const char *path, struct ckch_store *ckchs, struct 
 	 */
 
 	if (is_default) {
-		ckch_inst->is_default = 1;
+		ckch_inst->is_default = is_default;
 
 		/* insert an empty SNI which will be used to lookup default certificate */
 		order = ckch_inst_add_cert_sni(ctx, ckch_inst, bind_conf, ssl_conf, kinfo, "*", order);
@@ -3222,14 +3244,14 @@ int ssl_sock_load_cert_list_file(char *file, int dir, struct bind_conf *bind_con
 	list_for_each_entry(entry, &crtlist->ord_entries, by_crtlist) {
 		struct ckch_store *store;
 		struct ckch_inst *ckch_inst = NULL;
-		int is_default = 0;
+		int is_default = CKCH_INST_NO_DEFAULT;
 
 		store = entry->node.key;
 
 		/* if the SNI trees were empty the first "crt" become a default certificate,
 		 * it can be applied on multiple certificates if it's a bundle */
 		if (eb_is_empty(&bind_conf->sni_ctx) && eb_is_empty(&bind_conf->sni_w_ctx))
-			is_default = 1;
+			is_default = CKCH_INST_IMPL_DEFAULT;
 
 
 		cfgerr |= ssl_sock_load_ckchs(store->path, store, bind_conf, entry->ssl_conf, entry->filters, entry->fcount, is_default, &ckch_inst, err);
@@ -3284,9 +3306,9 @@ int ssl_sock_load_cert(char *path, struct bind_conf *bind_conf, int is_default, 
 
 	/* if the SNI trees were empty the first "crt" become a default certificate,
 	 * it can be applied on multiple certificates if it's a bundle */
-	if (is_default == 0) {
+	if (is_default == CKCH_INST_NO_DEFAULT) {
 		if (eb_is_empty(&bind_conf->sni_ctx) && eb_is_empty(&bind_conf->sni_w_ctx))
-			is_default = 1;
+			is_default = CKCH_INST_IMPL_DEFAULT;
 	}
 
 	if ((ckchs = ckchs_lookup(path))) {
@@ -4787,6 +4809,34 @@ int ssl_sock_prepare_bind_conf(struct bind_conf *bind_conf)
 		}
 	}
 
+	/* check that we didn't use "strict-sni" and "default-crt" together */
+	if (bind_conf->ssl_options & BC_SSL_O_STRICT_SNI) {
+		struct ebmb_node *node, *n;
+		const char *wildp = "";
+		int is_default = CKCH_INST_NO_DEFAULT;
+
+		node = ebst_lookup(&bind_conf->sni_w_ctx, wildp);
+		for (n = node; n; n = ebmb_next_dup(n)) {
+			struct sni_ctx *sni;
+
+			sni = container_of(n, struct sni_ctx, name);
+			if (!sni->neg) {
+
+				if (sni->ckch_inst->is_default == CKCH_INST_EXPL_DEFAULT) {
+					is_default = CKCH_INST_EXPL_DEFAULT;
+					break;
+				}
+			}
+		}
+
+		if (is_default ==  CKCH_INST_EXPL_DEFAULT) {
+			ha_diag_warning("Proxy '%s': both 'default-crt' and 'strict-sni' keywords are used in bind '%s' at [%s:%d], certificates won't be used as fallback (use 'crt' instead).\n",
+				   px->id, bind_conf->arg, bind_conf->file, bind_conf->line);
+		}
+
+	}
+
+
 	if ((bind_conf->options & BC_O_GENERATE_CERTS)) {
 		struct sni_ctx *sni_ctx;
 
@@ -5072,6 +5122,7 @@ static int ssl_sock_init(struct connection *conn, void **xprt_ctx)
 	ctx->xprt_st = 0;
 	ctx->xprt_ctx = NULL;
 	ctx->error_code = 0;
+	ctx->can_send_early_data = 1;
 
 	next_sslconn = increment_sslconn();
 	if (!next_sslconn) {
@@ -5216,6 +5267,37 @@ err:
 	return -1;
 }
 
+/* Update <counters> counters and <counters_px> proxy counters of frontends or
+ * backends with <ssl> as SSL connection object, depending on <backend> boolean
+ * value.
+ */
+void ssl_sock_update_counters(SSL *ssl,
+                              struct ssl_counters *counters,
+                              struct ssl_counters *counters_px,
+                              int backend)
+{
+	if (!SSL_session_reused(ssl)) {
+		if (backend) {
+			update_freq_ctr(&global.ssl_be_keys_per_sec, 1);
+			if (global.ssl_be_keys_per_sec.curr_ctr > global.ssl_be_keys_max)
+				global.ssl_be_keys_max = global.ssl_be_keys_per_sec.curr_ctr;
+		}
+		else {
+			update_freq_ctr(&global.ssl_fe_keys_per_sec, 1);
+			if (global.ssl_fe_keys_per_sec.curr_ctr > global.ssl_fe_keys_max)
+				global.ssl_fe_keys_max = global.ssl_fe_keys_per_sec.curr_ctr;
+		}
+
+		if (counters) {
+			HA_ATOMIC_INC(&counters->sess);
+			HA_ATOMIC_INC(&counters_px->sess);
+		}
+	}
+	else if (counters) {
+		HA_ATOMIC_INC(&counters->reused_sess);
+		HA_ATOMIC_INC(&counters_px->reused_sess);
+	}
+}
 
 /* This is the callback which is used when an SSL handshake is pending. It
  * updates the FD status if it wants some polling before being called again.
@@ -5230,7 +5312,7 @@ static int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 	struct ssl_counters *counters = NULL;
 	struct ssl_counters *counters_px = NULL;
 	struct listener *li;
-	struct server *srv;
+	struct server *srv = NULL;
 	socklen_t lskerr;
 	int skerr;
 
@@ -5299,9 +5381,22 @@ static int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 				goto check_error;
 			}
 			if (read_data > 0) {
+				const char *alpn;
+				int len;
+
 				TRACE_DEVEL("Early data read", SSL_EV_CONN_HNDSHK, conn, ctx->ssl);
 				conn->flags |= CO_FL_EARLY_DATA;
 				b_add(&ctx->early_buf, read_data);
+				if (ssl_sock_get_alpn(conn, ctx, &alpn, &len) != 0) {
+					/*
+					 * We have an ALPN set already, so we
+					 * know which mux to use, and we have
+					 * early data, let's create the mux
+					 * now.
+					 */
+					if (!conn->mux)
+						conn_create_mux(conn, NULL);
+				}
 			}
 			if (ret == SSL_READ_EARLY_DATA_FINISH) {
 				conn->flags &= ~CO_FL_EARLY_SSL_HS;
@@ -5420,6 +5515,7 @@ static int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 		/* read some data: consider handshake completed */
 		goto reneg_ok;
 	}
+	ctx->can_send_early_data = 0;
 	ret = SSL_do_handshake(ctx->ssl);
 check_error:
 	if (ret != 1) {
@@ -5548,27 +5644,7 @@ reneg_ok:
 		SSL_clear_mode(ctx->ssl, SSL_MODE_ASYNC);
 #endif
 	/* Handshake succeeded */
-	if (!SSL_session_reused(ctx->ssl)) {
-		if (objt_server(conn->target)) {
-			update_freq_ctr(&global.ssl_be_keys_per_sec, 1);
-			if (global.ssl_be_keys_per_sec.curr_ctr > global.ssl_be_keys_max)
-				global.ssl_be_keys_max = global.ssl_be_keys_per_sec.curr_ctr;
-		}
-		else {
-			update_freq_ctr(&global.ssl_fe_keys_per_sec, 1);
-			if (global.ssl_fe_keys_per_sec.curr_ctr > global.ssl_fe_keys_max)
-				global.ssl_fe_keys_max = global.ssl_fe_keys_per_sec.curr_ctr;
-		}
-
-		if (counters) {
-			HA_ATOMIC_INC(&counters->sess);
-			HA_ATOMIC_INC(&counters_px->sess);
-		}
-	}
-	else if (counters) {
-		HA_ATOMIC_INC(&counters->reused_sess);
-		HA_ATOMIC_INC(&counters_px->reused_sess);
-	}
+	ssl_sock_update_counters(ctx->ssl, counters, counters_px, !!srv);
 
 	TRACE_LEAVE(SSL_EV_CONN_HNDSHK, conn, ctx->ssl);
 
@@ -5608,7 +5684,7 @@ reneg_ok:
 	if (!conn->err_code)
 		conn->err_code = CO_ER_SSL_HANDSHAKE;
 
-	TRACE_ERROR("handshake error", SSL_EV_CONN_HNDSHK|SSL_EV_CONN_ERR, conn, ctx->ssl, &conn->err_code, &ctx->error_code);
+	TRACE_ERROR("handshake error", SSL_EV_CONN_HNDSHK|SSL_EV_CONN_ERR, conn, (ctx ? ctx->ssl : NULL), &conn->err_code, (ctx ? &ctx->error_code : NULL));
 	return 0;
 }
 
@@ -5890,7 +5966,12 @@ static size_t ssl_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 	}
 #endif
 
-	if (conn->flags & (CO_FL_WAIT_XPRT | CO_FL_SSL_WAIT_HS)) {
+	/*
+	 * We have to check can_send_early_data here, as the handshake flags
+	 * may have been removed in case we want to try to send early data.
+	 */
+	if (ctx->can_send_early_data ||
+	    (conn->flags & (CO_FL_WAIT_XPRT | CO_FL_SSL_WAIT_HS))) {
 		/* a handshake was requested */
 		TRACE_LEAVE(SSL_EV_CONN_RECV, conn);
 		return 0;
@@ -6063,7 +6144,7 @@ static size_t ssl_sock_from_buf(struct connection *conn, void *xprt_ctx, const s
 			ctx->xprt_st &= ~SSL_SOCK_SEND_MORE;
 
 #ifdef SSL_READ_EARLY_DATA_SUCCESS
-		if (!SSL_is_init_finished(ctx->ssl) && conn_is_back(conn)) {
+		if (ctx->can_send_early_data && conn_is_back(conn)) {
 			unsigned int max_early;
 
 			if (objt_listener(conn->target))
@@ -7060,6 +7141,36 @@ static void ssl_sock_clt_sni_free_func(void *parent, void *ptr, CRYPTO_EX_DATA *
 	pool_free(ssl_sock_client_sni_pool, ptr);
 }
 
+static void ssl_free_global(void)
+{
+	ha_free(&global_ssl.crt_base);
+	ha_free(&global_ssl.key_base);
+	ha_free(&global_ssl.ca_base);
+
+	ha_free(&global_ssl.issuers_chain_path);
+
+	ha_free(&global_ssl.listen_default_ciphers);
+	ha_free(&global_ssl.connect_default_ciphers);
+
+#ifdef HAVE_SSL_CTX_SET_CIPHERSUITES
+	ha_free(&global_ssl.listen_default_ciphersuites);
+	ha_free(&global_ssl.connect_default_ciphersuites);
+#endif
+
+#if defined(SSL_CTX_set1_curves_list)
+	ha_free(&global_ssl.listen_default_curves);
+	ha_free(&global_ssl.connect_default_curves);
+#endif
+
+#if defined(SSL_CTX_set1_sigalgs_list)
+	ha_free(&global_ssl.listen_default_sigalgs);
+	ha_free(&global_ssl.connect_default_sigalgs);
+
+	ha_free(&global_ssl.listen_default_client_sigalgs);
+	ha_free(&global_ssl.connect_default_client_sigalgs);
+#endif
+}
+
 static void __ssl_sock_init(void)
 {
 #if (!defined(OPENSSL_NO_COMP) && !defined(SSL_OP_NO_COMPRESSION))
@@ -7166,6 +7277,8 @@ static void __ssl_sock_init(void)
 	 * ssl_sock_register_msg_callback().
 	 */
 	hap_register_post_deinit(ssl_sock_unregister_msg_callbacks);
+
+	hap_register_post_deinit(ssl_free_global);
 }
 INITCALL0(STG_REGISTER, __ssl_sock_init);
 

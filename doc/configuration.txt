@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 3.2
-                              2025/07/09
+                              2025/10/03
 
 
 This document covers the configuration language as implemented in the version
@@ -1277,8 +1277,8 @@ Four other directives are provided to report some status:
   - .warning "message" : emit this message at level WARNING
   - .alert "message"   : emit this message at level ALERT
 
-Messages emitted at level WARNING may cause the process to fail to start if the
-"strict-mode" is enabled. Messages emitted at level ALERT will always cause a
+Messages emitted at level WARNING may cause the process to fail to start if
+"zero-warning" is enabled. Messages emitted at level ALERT will always cause a
 fatal error. These can be used to detect some inappropriate conditions and
 provide advice to the user.
 
@@ -1519,6 +1519,11 @@ socket type and the transport method.
                the FD from the unix socket and uses it as if it were the FD
                of an accept(). Should be used carefully.
 
+               Bugs: This protocol is known to be unreliable on macOS because
+               of an issue in the macOS sendmsg(2) implementation. The
+               connection might not be accepted correctly.
+
+
 'unix@<path>'  following string is considered as a UNIX socket <path>. this
                prefix is useful to declare an UNIX socket path which don't
                start by slash '/'.
@@ -1749,6 +1754,7 @@ The following keywords are supported in the "global" section :
    - insecure-setuid-wanted
    - issuers-chain-path
    - key-base
+   - limited-quic
    - localpeer
    - log
    - log-send-hostname
@@ -1758,6 +1764,7 @@ The following keywords are supported in the "global" section :
    - lua-prepend-path
    - mworker-max-reloads
    - nbthread
+   - no-quic
    - node
    - numa-cpu-mapping
    - ocsp-update.disable
@@ -1887,6 +1894,7 @@ The following keywords are supported in the "global" section :
    - tune.pool-low-fd-ratio
    - tune.pt.zero-copy-forwarding
    - tune.quic.cc-hystart
+   - tune.quic.cc.cubic.min-losses
    - tune.quic.disable-tx-pacing
    - tune.quic.disable-udp-gso
    - tune.quic.frontend.glitches-threshold
@@ -2453,7 +2461,14 @@ expose-deprecated-directives
 
 expose-experimental-directives
   This statement must appear before using directives tagged as experimental or
-  the config file will be rejected.
+  the config file will be rejected. Please note that features covered by this
+  option are not guaranteed to work well and may break during the maintenance
+  cycle. Developers will maintain them in best effort mode while the next
+  version is being worked on, and will deploy any reasonable effort to avoid
+  breaking them but with no guarantee. For these reasons, these features are
+  not expected to be supported beyond the release of the next LTS release.
+  Users who want to try experimental features are expected to upgrade quickly
+  to benefit from the improvements made to that feature.
 
 external-check [preserve-env]
   Allows the use of an external agent to perform health checks. This is
@@ -12110,9 +12125,9 @@ stats admin { if | unless } <cond>
     # statistics admin level depends on the authenticated user
     userlist stats-auth
         group admin    users admin
-        user  admin    insecure-password AdMiN123
+        user  admin    insecure-password 'AdMiN123'
         group readonly users haproxy
-        user  haproxy  insecure-password haproxy
+        user  haproxy  insecure-password 'haproxy'
 
     backend stats_auth
         stats enable
@@ -12167,8 +12182,9 @@ ssl-f-use [<sslbindconf> ...]*
   Assignate a certificate <crtname> to a crt-list created automatically with the
   frontend name and prefixed by @ (ex: '@frontend1').
 
-  This implicit crt-list will be assigned to every "ssl" bind lines in a
-  frontend that does not already have the "crt" or the "crt-list" line.
+  This implicit crt-list will be assigned to every "ssl" bind lines in the
+  current frontend.
+
   crt-list commands from the stats socket are effective with this crt-list, so
   one could replace, remove or add certificates and SSL options to it.
 
@@ -16572,9 +16588,13 @@ crt-list <file>
 
 default-crt <cert>
   This option does the same as the "crt" option, with the difference that this
-  certificate will be used as a default one. It is possible to add multiple
-  default certificates to have an ECDSA and an RSA one, having more is not
-  really useful.
+  certificate will be used as a default one as well. It is possible to add
+  multiple default certificates to have an ECDSA and an RSA one, having more is
+  not really useful.
+
+  This option does not disable implicit default certificates, if a 'crt'
+  certificate is declared first before any 'default-crt' or other 'crt' it will
+  still be used as a default certificate.
 
   A default certificate is used when no "strict-sni" option is used on the bind
   line. A default certificate is provided when the servername extension was not
@@ -16583,7 +16603,11 @@ default-crt <cert>
 
   Example:
 
+     # this bind line has 2 default certificates
      bind *:443 default-crt foobar.pem.rsa default-crt foobar.pem.ecdsa crt website.pem.rsa
+
+     # this bind line has 3 default certificates
+     bind *:443 crt website.pem.rsa default-crt foobar.pem.rsa default-crt foobar.pem.ecdsa
 
   See also the "crt" keyword.
 
@@ -19815,8 +19839,10 @@ aes_gcm_dec(bits,nonce,key,aead_tag)               binary       binary
 aes_gcm_enc(bits,nonce,key,aead_tag)               binary       binary
 and(value)                                         integer      integer
 b64dec                                             string       binary
+base2                                              binary       string
 base64                                             binary       string
 be2dec(separator,chunk_size[,truncate])            binary       string
+le2dec(separator,chunk_size[,truncate])            binary       string
 be2hex([separator[,chunk_size[,truncate]]])        binary       string
 bool                                               integer      boolean
 bytes(offset[,length])                             binary       binary
@@ -20038,6 +20064,12 @@ b64dec
   For base64url("URL and Filename Safe Alphabet" (RFC 4648)) variant
   see "ub64dec".
 
+base2
+  Converts a binary input sample to a binary string containing eight binary
+  digits per input byte. It is used to be able to perform longest prefix match
+  on types where the native representation does not allow prefix matching, for
+  example IP prefixes.
+
 base64
   Converts a binary input sample to a base64 string. It is used to log or
   transfer binary content in a way that can be reliably transferred (e.g.
@@ -20056,6 +20088,19 @@ be2dec(<separator>,<chunk_size>[,<truncate>])
       bin(01020304050607),be2dec(-,2,1) # 258-772-1286
       bin(01020304050607),be2dec(,2,1)  # 2587721286
       bin(7f000001),be2dec(.,1)         # 127.0.0.1
+
+le2dec(<separator>,<chunk_size>[,<truncate>])
+  Converts little-endian binary input sample to a string containing an unsigned
+  integer number per <chunk_size> input bytes. <separator> is inserted every
+  <chunk_size> binary input bytes if specified. The <truncate> flag indicates
+  whether the binary input is truncated at <chunk_size> boundaries. The maximum
+  value for <chunk_size> is limited by the size of long long int (8 bytes).
+
+  Example:
+      bin(01020304050607),le2dec(:,2)   # 513:1284:2055:7
+      bin(01020304050607),le2dec(-,2,1) # 513-1284-2055
+      bin(01020304050607),le2dec(,2,1)  # 51312842055
+      bin(7f000001),le2dec(.,1)         # 127.0.0.1
 
 be2hex([<separator>[,<chunk_size>[,<truncate>]]])
   Converts big-endian binary input sample to a hex string containing two hex
@@ -20423,6 +20468,12 @@ json_query(<json_path>[,<output_type>])
 
   <json_path> must be a valid JSON Path string as defined in
   https://datatracker.ietf.org/doc/draft-ietf-jsonpath-base/
+
+  Note: depending on the context and the underlying implementation, extraction
+        of duplicate JSON keys is undefined and might return the first, last,
+        or any other occurrence of the same key from the input content, and if
+        key names are passed encoded, they might not always be matched. In
+        short, this converter is not suitable for content sanitization.
 
   Example:
      # get a integer value from the request body
@@ -23788,6 +23839,7 @@ ssl_bc_server_random                               binary
 ssl_bc_server_traffic_secret_0                     string
 ssl_bc_session_id                                  binary
 ssl_bc_session_key                                 binary
+ssl_bc_sni                                         string
 ssl_bc_unique_id                                   binary
 ssl_bc_use_keysize                                 integer
 ssl_c_ca_err                                       integer
@@ -24118,6 +24170,13 @@ ssl_bc_session_key : binary
   connection was made over an SSL/TLS transport layer. It is useful to decrypt
   traffic sent using ephemeral ciphers. This requires OpenSSL >= 1.1.0, or
   BoringSSL. It can be used in a tcp-check or an http-check ruleset.
+
+ssl_bc_sni : string
+  This retrieves the Server Name Indication TLS extension (SNI) field that was
+  used on the connection to the server. The result (when present) typically is
+  a string matching the HTTPS host name (253 chars or less). The main use case
+  is for logging and debugging purposes (e.g. figure what SNI was used when the
+  connection was established to match it against what the server has seen).
 
 ssl_bc_unique_id : binary
   When the outgoing connection was made over an SSL/TLS transport layer,
@@ -29692,22 +29751,26 @@ user <username> [password|insecure-password <password>]
   slower than their glibc counterparts when calculating hashes, so you might
   want to consider this aspect too.
 
+  All passwords are considered normal arguments and are therefor subject to
+  regular section 2.2 Quoting and escaping. Single quoting passwords is
+  therefor recommended.
+
   Example:
         userlist L1
           group G1 users tiger,scott
           group G2 users xdb,scott
 
           user tiger password $6$k6y3o.eP$JlKBx9za9667qe4(...)xHSwRv6J.C0/D7cV91
-          user scott insecure-password elgato
-          user xdb insecure-password hello
+          user scott insecure-password 'elgato'
+          user xdb insecure-password 'hello'
 
         userlist L2
           group G1
           group G2
 
           user tiger password $6$k6y3o.eP$JlKBx(...)xHSwRv6J.C0/D7cV91 groups G1
-          user scott insecure-password elgato groups G1,G2
-          user xdb insecure-password hello groups G2
+          user scott insecure-password 'elgato' groups G1,G2
+          user xdb insecure-password 'hello' groups G2
 
   Please note that both lists are functionally identical.
 
@@ -30325,8 +30388,8 @@ bits <number>
   but blocking the traffic too long could trigger the watchdog.)
 
 challenge <string>
-  Takes a challenge type as parameter, this must be HTTP-01 or DNS-01. When not
-  used the default is HTTP-01.
+  Takes a challenge type as parameter, this must be http-01 or dns-01. When not
+  used the default is http-01.
 
 contact <string>
   The contact email that will be associated to the account key in the CA.
@@ -30369,7 +30432,7 @@ Example:
       directory https://acme-staging-v02.api.letsencrypt.org/directory
       account-key /etc/haproxy/letsencrypt.account.key
       contact john.doe@example.com
-      challenge HTTP-01
+      challenge http-01
       keytype RSA
       bits 2048
       map virt@acme
@@ -30378,7 +30441,7 @@ Example:
       directory https://acme-staging-v02.api.letsencrypt.org/directory
       account-key /etc/haproxy/letsencrypt.account.key
       contact john.doe@example.com
-      challenge HTTP-01
+      challenge http-01
       keytype ECDSA
       curves P-384
       map virt@acme

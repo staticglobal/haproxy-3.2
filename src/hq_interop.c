@@ -93,7 +93,7 @@ static ssize_t hq_interop_rcv_buf(struct qcs *qcs, struct buffer *b, int fin)
 }
 
 static size_t hq_interop_snd_buf(struct qcs *qcs, struct buffer *buf,
-                                 size_t count)
+                                 size_t count, char *fin)
 {
 	enum htx_blk_type btype;
 	struct htx *htx = NULL;
@@ -102,9 +102,13 @@ static size_t hq_interop_snd_buf(struct qcs *qcs, struct buffer *buf,
 	uint32_t bsize, fsize;
 	struct buffer *res = NULL;
 	size_t total = 0;
+	char eom;
 	int err;
 
+	*fin = 0;
 	htx = htx_from_buf(buf);
+	/* EOM is saved here, useful if 0-copy is performed with HTX buf. */
+	eom = htx->flags & HTX_FL_EOM;
 
 	while (count && !htx_is_empty(htx) && qcc_stream_can_send(qcs)) {
 		/* Not implemented : QUIC on backend side */
@@ -181,6 +185,8 @@ static size_t hq_interop_snd_buf(struct qcs *qcs, struct buffer *buf,
 	}
 
  end:
+	if (eom && htx_is_empty(htx))
+		*fin = 1;
 	htx_to_buf(htx, buf);
 
 	return total;

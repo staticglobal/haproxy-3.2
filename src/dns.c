@@ -65,12 +65,55 @@ static int dns_connect_nameserver(struct dns_nameserver *ns)
 			 ns->counters->pid, ns->id);
 		return -1;
 	}
-	if (connect(fd, (struct sockaddr*)&dgram->addr.to, get_addr_len(&dgram->addr.to)) == -1) {
-		send_log(NULL, LOG_WARNING,
-			 "DNS : section '%s': can't connect socket for nameserver '%s'.\n",
-			 ns->counters->id, ns->id);
+
+	switch (proto->fam->sock_domain) {
+	case AF_INET: {
+		struct sockaddr_in address = {
+			.sin_family = AF_INET,
+			.sin_port = 0,
+			.sin_addr = { .s_addr = INADDR_ANY }
+		};
+		if (bind(fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+			send_log(NULL, LOG_WARNING,
+				 "DNS : section '%s': can't bind socket for nameserver '%s' on 0.0.0.0:0.\n",
+				 ns->counters->pid, ns->id);
+			close(fd);
+			return -1;
+		}
+		break;
+	}
+	case AF_INET6: {
+		struct sockaddr_in6 address6 = {
+			.sin6_family = AF_INET6,
+			.sin6_port = 0,
+			.sin6_addr = in6addr_any,
+			.sin6_flowinfo = 0,
+			.sin6_scope_id = 0
+		};
+		if (bind(fd, (struct sockaddr *)&address6, sizeof(address6)) < 0) {
+			send_log(NULL, LOG_WARNING,
+				 "DNS : section '%s': can't bind socket for nameserver '%s' on :::0.\n",
+				 ns->counters->pid, ns->id);
+			close(fd);
+			return -1;
+		}
+		break;
+	}
+	case AF_UNIX:
+		/* if IPC is used via local domain sockets, we don't expect that
+		 * the path to DNS server socket can change dynamically.
+		 */
+		if (connect(fd, (struct sockaddr*)&dgram->addr.to, get_addr_len(&dgram->addr.to)) == -1) {
+			send_log(NULL, LOG_WARNING,
+				 "DNS : section '%s': can't connect socket for nameserver '%s'.\n",
+				 ns->counters->id, ns->id);
+			close(fd);
+			return -1;
+		}
+		break;
+	default:
 		close(fd);
-		return -1;
+		BUG_ON(1, "DNS: Unsupported address family.");
 	}
 
 	/* Make the socket non blocking */
@@ -78,7 +121,13 @@ static int dns_connect_nameserver(struct dns_nameserver *ns)
 
 	/* Add the fd in the fd list and update its parameters */
 	dgram->t.sock.fd = fd;
-	fd_insert(fd, dgram, dgram_fd_handler, tgid, tg->threads_enabled);
+
+	/* let's stick the FD to the initiator thread, this will ensure that
+	 * most of the time, a resolver will not try to access its structure
+	 * at the same time as a response is processed, and will eliminate
+	 * locking contention.
+	 */
+	fd_insert(fd, dgram, dgram_fd_handler, tgid, ti->ltid_bit);
 	fd_want_recv(fd);
 	return 0;
 }
@@ -106,7 +155,17 @@ int dns_send_nameserver(struct dns_nameserver *ns, void *buf, size_t len)
 			fd = dgram->t.sock.fd;
 		}
 
-		ret = send(fd, buf, len, 0);
+		if (dgram->addr.to.ss_family == AF_UNIX) {
+			/* we do connect for AF_UNIX sockets and from the man
+			 * sendto: "If sendto() is  used on a connection-mode
+			 * (SOCK_STREAM, SOCK_SEQPACKET) socket, the arguments
+			 * dest_addr and addrlen are ignored (and the error
+			 * EISCONN may be returned when they are not NULL and 0)..."
+			 */
+			ret = send(fd, buf, len, 0);
+		} else
+			ret = sendto(fd, buf, len, 0, (struct sockaddr*)&dgram->addr.to, get_addr_len(&dgram->addr.to));
+
 		if (ret < 0) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK) {
 				struct ist myist;
@@ -832,6 +891,7 @@ static int dns_session_init(struct appctx *appctx)
 
 	applet_expect_no_data(appctx);
 	ds->appctx = appctx;
+	appctx->t->expire = TICK_ETERNITY;
 	return 0;
 
   error:

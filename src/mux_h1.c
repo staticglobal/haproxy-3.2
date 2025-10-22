@@ -527,7 +527,8 @@ static inline int h1_recv_allowed(const struct h1c *h1c)
 		return 0;
 	}
 
-	if (h1c->conn->flags & (CO_FL_WAIT_L4_CONN|CO_FL_WAIT_L6_CONN)) {
+	if (h1c->conn->flags & (CO_FL_WAIT_L4_CONN|CO_FL_WAIT_L6_CONN) &&
+	    !(h1c->conn->flags & CO_FL_EARLY_DATA)) {
 		TRACE_DEVEL("recv not allowed because of (waitl4|waitl6) on connection", H1_EV_H1C_RECV|H1_EV_H1C_BLK, h1c->conn);
 		return 0;
 	}
@@ -1400,9 +1401,6 @@ static void h1_release(struct h1c *h1c)
 	pool_free(pool_head_h1c, h1c);
 
 	if (conn) {
-		if (!conn_is_back(conn))
-			LIST_DEL_INIT(&conn->stopping_list);
-
 		conn->mux = NULL;
 		conn->ctx = NULL;
 		TRACE_DEVEL("freeing conn", H1_EV_H1C_END, conn);
@@ -3661,20 +3659,23 @@ static void h1_alert(struct h1s *h1s)
 */
 static int h1_send_error(struct h1c *h1c)
 {
+	struct buffer *errmsg = NULL;
 	int rc = http_get_status_idx(h1c->errcode);
 	int ret = 0;
 
 	TRACE_ENTER(H1_EV_H1C_ERR, h1c->conn, 0, 0, (size_t[]){h1c->errcode});
 
-	/* Verify if the error is mapped on /dev/null or any empty file */
-	/// XXX: do a function !
+	/* Get the error file, if any */
 	if (h1c->px->replies[rc] &&
 	    h1c->px->replies[rc]->type == HTTP_REPLY_ERRMSG &&
-	    h1c->px->replies[rc]->body.errmsg &&
-	    b_is_null(h1c->px->replies[rc]->body.errmsg)) {
-		/* Empty error, so claim a success */
-		ret = 1;
-		goto out_abort;
+	    h1c->px->replies[rc]->body.errmsg) {
+		/* Verify if the error is mapped on /dev/null or any empty file */
+		if (b_is_null(h1c->px->replies[rc]->body.errmsg)) {
+			/* Empty error, so claim a success */
+			ret = 1;
+			goto out_abort;
+		}
+		errmsg = h1c->px->replies[rc]->body.errmsg;
 	}
 
 	if (h1c->flags & (H1C_F_OUT_ALLOC|H1C_F_OUT_FULL)) {
@@ -3687,7 +3688,10 @@ static int h1_send_error(struct h1c *h1c)
 		TRACE_STATE("waiting for h1c obuf allocation", H1_EV_H1C_ERR|H1_EV_H1C_BLK, h1c->conn);
 		goto out;
 	}
-	ret = b_istput(&h1c->obuf, ist(http_err_msgs[rc]));
+	if (errmsg)
+		ret = h1_format_htx_msg(htxbuf(errmsg), &h1c->obuf);
+	else
+		ret = b_istput(&h1c->obuf, ist(http_err_msgs[rc]));
 	if (unlikely(ret <= 0)) {
 		if (!ret) {
 			h1c->flags |= (H1C_F_OUT_FULL|H1C_F_ABRT_PENDING);
@@ -4400,7 +4404,7 @@ struct task *h1_timeout_task(struct task *t, void *context, unsigned int state)
 			se_fl_set(h1c->h1s->sd, SE_FL_EOS | SE_FL_ERROR);
 			h1_alert(h1c->h1s);
 			h1_refresh_timeout(h1c);
-			HA_SPIN_UNLOCK(OTHER_LOCK, &idle_conns[tid].idle_conns_lock);
+			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 			TRACE_DEVEL("waiting to release the SC before releasing the connection", H1_EV_H1C_WAKE);
 			return t;
 		}

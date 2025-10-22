@@ -202,7 +202,7 @@ static int qc_may_build_pkt(struct quic_conn *qc, struct list *frms,
 		 (force_ack || nb_aepkts_since_last_ack >= QUIC_MAX_RX_AEPKTS_SINCE_LAST_ACK));
 
 	TRACE_PRINTF(TRACE_LEVEL_DEVELOPER, QUIC_EV_CONN_PHPKTS, qc, 0, 0, 0,
-	             "%c has_sec=%d cc=%d probe=%d must_ack=%d frms=%d prep_in_fligh=%llu cwnd=%llu",
+	             "%c has_sec=%d cc=%d probe=%d must_ack=%d frms=%d prep_in_flight=%llu cwnd=%llu",
 	             quic_enc_level_char_from_qel(qel, qc),
 	             quic_tls_has_tx_sec(qel), cc, probe, *must_ack, LIST_ISEMPTY(frms),
 	             (ullong)qc->path->prep_in_flight, (ullong)qc->path->cwnd);
@@ -620,6 +620,7 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 			enum quic_pkt_type pkt_type;
 			struct quic_tx_packet *cur_pkt;
 			enum qc_build_pkt_err err;
+			int final_packet = 0;
 
 			TRACE_PROTO("TX prep pkts", QUIC_EV_CONN_PHPKTS, qc, qel);
 
@@ -655,32 +656,36 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 			 * datagrams carrying ack-eliciting Initial packets to at least the
 			 * smallest allowed maximum datagram size of 1200 bytes.
 			 */
+
+			/* Padding is activated as soon as Initial data is
+			 * present in the datagram. The only exception is on
+			 * server side if Initial content is not ack-eliciting
+			 * (e.g. a single ACK frame sent as Initial).
+			 */
 			if (qel == qc->iel && (!LIST_ISEMPTY(frms) || probe)) {
 				 /* Ensure that no ack-eliciting packets are sent into too small datagrams */
-				if (end - pos < QUIC_INITIAL_PACKET_MINLEN) {
+				if (end - pos + dglen < QUIC_INITIAL_PACKET_MINLEN) {
 					TRACE_PROTO("No more enough room to build an Initial packet",
 					            QUIC_EV_CONN_PHPKTS, qc);
 					break;
 				}
 
-				/* padding will be set for last QEL, except when probing:
-				 * to build a PING only non coalesced Initial datagram for
-				 * instance when blocked by the anti-amplification limit,
-				 * this datagram MUST be padded.
-				 */
 				padding = 1;
 			}
 
-			pkt_type = quic_enc_level_pkt_type(qc, qel);
-			/* <paddding> parameter for qc_build_pkt() must not be set to 1 when
-			 * building PING only Initial datagram (a datagram with an Initial
-			 * packet inside containing only a PING frame as ack-eliciting
-			 * frame). This is the case when both <probe> and LIST_EMPTY(<frms>)
-			 * conditions are verified (see qc_do_build_pkt()).
+
+			/* TODO currently it's not possible to emit an ACK and probing data simultaneously (see qc_do_build_pkt()).
+			 * As a side-effect, this could cause coalescing of two packets of the same type which should be avoided.
+			 * To implement this, a new datagram is forced by invokation of qc_txb_store(). This must then be checked
+			 * if padding is required as in this case this will be the last packet of the current datagram.
 			 */
+			if (probe && (must_ack || (qel->pktns->flags & QUIC_FL_PKTNS_ACK_REQUIRED)))
+				final_packet = 1;
+
+			pkt_type = quic_enc_level_pkt_type(qc, qel);
 			cur_pkt = qc_build_pkt(&pos, end, qel, tls_ctx, frms,
 			                       qc, ver, dglen, pkt_type, must_ack,
-			                       padding && !next_qel && (!probe || !LIST_ISEMPTY(frms)),
+			                       padding && (!next_qel || final_packet),
 			                       probe, cc, &err);
 			if (!cur_pkt) {
 				switch (err) {
@@ -758,7 +763,7 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 			if (probe && qel == qc->ael)
 				break;
 
-			if (LIST_ISEMPTY(frms)) {
+			if (LIST_ISEMPTY(frms) && !final_packet) {
 				/* Everything sent. Continue within the same datagram. */
 				prv_pkt = cur_pkt;
 			}
@@ -774,7 +779,7 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 				 */
 				prv_pkt = cur_pkt;
 				dglen = 0;
-
+				padding = 0;
 			}
 			else {
 				/* Finalize current datagram if not all frames sent. */
@@ -967,15 +972,15 @@ int qc_dgrams_retransmit(struct quic_conn *qc)
 
 			qc_prep_hdshk_fast_retrans(qc, &ifrms, &hfrms);
 			TRACE_DEVEL("Avail. ack eliciting frames", QUIC_EV_CONN_FRMLIST, qc, &ifrms);
-			TRACE_DEVEL("Avail. ack eliciting frames", QUIC_EV_CONN_FRMLIST, qc, &hfrms);
 			if (!LIST_ISEMPTY(&ifrms)) {
 				ipktns->tx.pto_probe = 1;
-				if (!LIST_ISEMPTY(&hfrms))
-					hpktns->tx.pto_probe = 1;
-
 				qel_register_send(&send_list, qc->iel, &ifrms);
-				if (qc->hel)
+
+				if (!LIST_ISEMPTY(&hfrms)) {
+					TRACE_DEVEL("Avail. ack eliciting frames", QUIC_EV_CONN_FRMLIST, qc, &hfrms);
+					hpktns->tx.pto_probe = 1;
 					qel_register_send(&send_list, qc->hel, &hfrms);
+				}
 
 				sret = qc_send(qc, 1, &send_list, 0);
 				qc_free_frm_list(qc, &ifrms);
@@ -1711,19 +1716,14 @@ static inline uint64_t quic_compute_ack_delay_us(unsigned int time_received,
  * number field in this packet. <pn_len> will also have the packet number
  * length as value.
  *
+ * Caller must set <padding> when building the last packet of a datagram which
+ * must be at least 1.200 bytes long. Note that padding can also be added
+ * automatically to ensure packet size is big enough for header protection
+ * sampling.
+ *
  * NOTE: This function does not build all the possible combinations of packets
  * depending on its list of parameters. In most cases, <frms> frame list is
  * not empty. So, this function first tries to build this list of frames.
- * Then some padding is added to this packet if <padding> boolean is set true.
- * The unique case one wants to do that is when a first Initial packet was
- * previously built into the same datagram as the currently built one and when
- * this packet is supposed to pad the datagram, if needed, to build an at
- * least 1200 bytes long Initial datagram.
- * If <padding> is not true, if the packet is too short, the packet is also
- * padded. This is very often the case when no frames are provided by <frms>
- * and when probing with only a PING frame.
- * Finally, if <frms> was empty, if <probe> boolean is true this function builds
- * a PING only packet handling also the cases where it must be padded.
  *
  * Return 1 if succeeded (enough room to buile this packet), O if not.
  */
@@ -1804,6 +1804,7 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 	/* Build an ACK frame if required. */
 	ack_frm_len = 0;
 	/* Do not ack and probe at the same time. */
+	/* TODO qc_do_build_pkt() must rely on its <probe> argument instead of using QEL <pto_probe> field. */
 	if ((must_ack || (qel->pktns->flags & QUIC_FL_PKTNS_ACK_REQUIRED)) && !qel->pktns->tx.pto_probe) {
 		struct quic_arngs *arngs = &qel->pktns->rx.arngs;
 		BUG_ON(eb_is_empty(&qel->pktns->rx.arngs.root));
@@ -1850,6 +1851,7 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 				goto comp_pkt_len;
 			}
 
+			/* TODO qc_do_build_pkt() must rely on its <probe> argument instead of using QEL <pto_probe> field. */
 			if (qel->pktns->tx.pto_probe) {
 				/* If a probing packet was asked and could not be built,
 				 * this is not because there was not enough room, but due to
@@ -1898,6 +1900,15 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 		dglen += len_sz;
 	}
 
+	/* TODO qc_do_build_pkt() must rely on its <probe> argument instead of using QEL <pto_probe> field. */
+	if (qel->pktns->tx.pto_probe && LIST_ISEMPTY(&frm_list) && !cc) {
+		/* Send PING if probing required but no frame avail for sending. */
+		add_ping_frm = 1;
+		len += 1;
+		dglen += 1;
+	}
+
+	/* Handle Initial packet padding if necessary. */
 	if (padding && dglen < QUIC_INITIAL_PACKET_MINLEN) {
 		padding_len = QUIC_INITIAL_PACKET_MINLEN - dglen;
 
@@ -1912,37 +1923,33 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 			}
 		}
 	}
-	else if (len_frms && len_frms < QUIC_PACKET_PN_MAXLEN) {
-		len += padding_len = QUIC_PACKET_PN_MAXLEN - len_frms;
-	}
-	else if (LIST_ISEMPTY(&frm_list)) {
-		if (qel->pktns->tx.pto_probe) {
-			/* If we cannot send a frame, we send a PING frame. */
-			add_ping_frm = 1;
-			len += 1;
-			dglen += 1;
-			/* Note that only we are in the case where this Initial packet
-			 * is not coalesced to an Handshake packet. We must directly
-			 * pad the datragram.
-			 */
-			if (pkt->type == QUIC_PACKET_TYPE_INITIAL) {
-				if (dglen < QUIC_INITIAL_PACKET_MINLEN) {
-					padding_len = QUIC_INITIAL_PACKET_MINLEN - dglen;
-					padding_len -= quic_int_getsize(len + padding_len) - len_sz;
-					len += padding_len;
-				}
-			}
-			else {
-				/* Note that +1 is for the PING frame */
-				if (*pn_len + 1 < QUIC_PACKET_PN_MAXLEN)
-					len += padding_len = QUIC_PACKET_PN_MAXLEN - *pn_len - 1;
-			}
-		}
-		else {
-			/* If there is no frame at all to follow, add at least a PADDING frame. */
-			if (!ack_frm_len && !cc)
-				len += padding_len = QUIC_PACKET_PN_MAXLEN - *pn_len;
-		}
+
+	/* RFC 9001 5.4.2. Header Protection Sample
+	 *
+	 * To ensure that sufficient data is available for sampling, packets are
+	 * padded so that the combined lengths of the encoded packet number and
+	 * protected payload is at least 4 bytes longer than the sample required
+	 * for header protection. The cipher suites defined in [TLS13] -- other
+	 * than TLS_AES_128_CCM_8_SHA256, for which a header protection scheme
+	 * is not defined in this document -- have 16-byte expansions and 16-
+	 * byte header protection samples. This results in needing at least 3
+	 * bytes of frames in the unprotected payload if the packet number is
+	 * encoded on a single byte, or 2 bytes of frames for a 2-byte packet
+	 * number encoding.
+	 */
+
+	/* Add padding if packet is too small for HP sampling as specified
+	 * above. QUIC TLS algos relies on 16 bytes sample extracted
+	 * QUIC_PACKET_PN_MAXLEN(4) bytes after the PN offset Thus, pn and payload
+	 * must be at least QUIC_PACKET_PN_MAXLEN(4) bytes long, so that the sample
+	 * will be extracted as the AEAD tag.
+	 *
+	 * Note that from here, <len> includes <*pn_len>, the total frame lenghts,
+	 * and QUIC_TLS_TAG_LEN(16).
+	 */
+	if (len < QUIC_PACKET_PN_MAXLEN + QUIC_HP_SAMPLE_LEN) {
+		padding_len = QUIC_PACKET_PN_MAXLEN + QUIC_HP_SAMPLE_LEN - len;
+		len += padding_len;
 	}
 
 	if (pkt->type != QUIC_PACKET_TYPE_SHORT && !quic_enc_int(&pos, end, len))
@@ -2015,7 +2022,7 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 		goto no_room;
 	}
 
-	BUG_ON(qel->pktns->tx.pto_probe &&
+	BUG_ON(qel->pktns->tx.pto_probe && !cc &&
 	       !(pkt->flags & QUIC_FL_TX_PACKET_ACK_ELICITING));
 	/* If this packet is ack-eliciting and we are probing let's
 	 * decrement the PTO probe counter.

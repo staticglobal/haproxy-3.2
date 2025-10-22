@@ -377,10 +377,11 @@ int httpclient_res_xfer(struct httpclient *hc, struct buffer *dst)
 	int ret;
 
 	ret = b_force_xfer(dst, &hc->res.buf, MIN(room, b_data(&hc->res.buf)));
+
 	/* call the client once we consumed all data */
 	if (!b_data(&hc->res.buf)) {
 		b_free(&hc->res.buf);
-		if (hc->appctx)
+		if (ret && hc->appctx)
 			appctx_wakeup(hc->appctx);
 	}
 	return ret;
@@ -402,18 +403,21 @@ int httpclient_req_xfer(struct httpclient *hc, struct ist src, int end)
 	int ret = 0;
 	struct htx *htx;
 
+	if (hc->flags & HTTPCLIENT_FA_DRAIN_REQ) {
+		ret = istlen(src);
+		goto end;
+	}
+
 	if (!b_alloc(&hc->req.buf, DB_CHANNEL))
-		goto error;
+		goto end;
 
 	htx = htx_from_buf(&hc->req.buf);
 	if (!htx)
-		goto error;
-
-	if (hc->appctx)
-		appctx_wakeup(hc->appctx);
-
+		goto end;
 	ret += htx_add_data(htx, src);
 
+	if (ret && hc->appctx)
+		appctx_wakeup(hc->appctx);
 
 	/* if we copied all the data and the end flag is set */
 	if ((istlen(src) == ret) && end) {
@@ -425,13 +429,13 @@ int httpclient_req_xfer(struct httpclient *hc, struct ist src, int end)
 		 */
 		if (htx_is_empty(htx)) {
 			if (!htx_add_endof(htx, HTX_BLK_EOT))
-				goto error;
+				goto end;
 		}
 		htx->flags |= HTX_FL_EOM;
 	}
 	htx_to_buf(htx, &hc->req.buf);
 
-error:
+  end:
 
 	return ret;
 }
@@ -723,7 +727,6 @@ void httpclient_applet_io_handler(struct appctx *appctx)
 		goto out;
 
 	while (1) {
-
 		/* required to stop */
 		if (hc->flags & HTTPCLIENT_FA_STOP)
 			goto error;
@@ -751,71 +754,89 @@ void httpclient_applet_io_handler(struct appctx *appctx)
 
 				channel_add_input(req, htx->data);
 
-				if (htx->flags & HTX_FL_EOM) /* check if a body need to be added */
+				if (htx->flags & HTX_FL_EOM) { /* check if a body need to be added */
 					appctx->st0 = HTTPCLIENT_S_RES_STLINE;
-				else
-					appctx->st0 = HTTPCLIENT_S_REQ_BODY;
+					se_fl_set(appctx->sedesc, SE_FL_EOI);
+					break;
+				}
 
+				applet_have_more_data(appctx);
+				appctx->st0 = HTTPCLIENT_S_REQ_BODY;
 				goto out; /* we need to leave the IO handler once we wrote the request */
 				break;
 
 			case HTTPCLIENT_S_REQ_BODY:
 				/* call the payload callback */
-				{
-					if (hc->ops.req_payload) {
-						struct htx *hc_htx;
+				if (hc->ops.req_payload) {
+					struct htx *hc_htx;
 
-						/* call the request callback */
-						hc->ops.req_payload(hc);
-
-						hc_htx = htxbuf(&hc->req.buf);
-						if (htx_is_empty(hc_htx))
-							goto out;
-
-						htx = htx_from_buf(&req->buf);
-						if (htx_is_empty(htx)) {
-							size_t data = hc_htx->data;
-
-							/* Here htx_to_buf() will set buffer data to 0 because
-							 * the HTX is empty, and allow us to do an xfer.
-							 */
-							htx_to_buf(hc_htx, &hc->req.buf);
-							htx_to_buf(htx, &req->buf);
-							b_xfer(&req->buf, &hc->req.buf, b_data(&hc->req.buf));
-							channel_add_input(req, data);
-						} else {
-							struct htx_ret ret;
-
-							ret = htx_xfer_blks(htx, hc_htx, htx_used_space(hc_htx), HTX_BLK_UNUSED);
-							channel_add_input(req, ret.ret);
-
-							/* we must copy the EOM if we empty the buffer */
-							if (htx_is_empty(hc_htx)) {
-								htx->flags |= (hc_htx->flags & HTX_FL_EOM);
-							}
-							htx_to_buf(htx, &req->buf);
-							htx_to_buf(hc_htx, &hc->req.buf);
-						}
-
-
-						if (!b_data(&hc->req.buf))
-							b_free(&hc->req.buf);
+					if (co_data(res)) {
+						/* A response was received but we are still process the request.
+						 * It is unexpected and not really supported with the current API.
+						 * So lets drain the request to avoid any issue.
+						 */
+						b_reset(&hc->req.buf);
+						hc->flags |= HTTPCLIENT_FA_DRAIN_REQ;
+						appctx->st0 = HTTPCLIENT_S_RES_STLINE;
+						break;
 					}
 
-					htx = htxbuf(&req->buf);
+					/* call the request callback */
+					hc->ops.req_payload(hc);
 
-					/* if the request contains the HTX_FL_EOM, we finished the request part. */
-					if (htx->flags & HTX_FL_EOM)
-						appctx->st0 = HTTPCLIENT_S_RES_STLINE;
+					hc_htx = htxbuf(&hc->req.buf);
+					if (htx_is_empty(hc_htx))
+						goto out;
 
-					goto process_data; /* we need to leave the IO handler once we wrote the request */
+					htx = htx_from_buf(&req->buf);
+					if (htx_is_empty(htx)) {
+						size_t data = hc_htx->data;
+
+						/* Here htx_to_buf() will set buffer data to 0 because
+						 * the HTX is empty, and allow us to do an xfer.
+						 */
+						htx_to_buf(hc_htx, &hc->req.buf);
+						htx_to_buf(htx, &req->buf);
+						b_xfer(&req->buf, &hc->req.buf, b_data(&hc->req.buf));
+						channel_add_input(req, data);
+					} else {
+						struct htx_ret ret;
+						size_t data = htx->data;
+
+						ret = htx_xfer_blks(htx, hc_htx, htx_used_space(hc_htx), HTX_BLK_UNUSED);
+						if (!ret.ret) {
+							sc_need_room(sc, channel_htx_recv_max(req, htx) + 1);
+							goto out;
+						}
+						data = htx->data - data;
+						channel_add_input(req, data);
+
+						/* we must copy the EOM if we empty the buffer */
+						if (htx_is_empty(hc_htx)) {
+							htx->flags |= (hc_htx->flags & HTX_FL_EOM);
+						}
+						htx_to_buf(htx, &req->buf);
+						htx_to_buf(hc_htx, &hc->req.buf);
+					}
+
+
+					if (!b_data(&hc->req.buf))
+						b_free(&hc->req.buf);
 				}
-				break;
+
+				htx = htxbuf(&req->buf);
+
+				/* if the request contains the HTX_FL_EOM, we finished the request part. */
+				if (htx->flags & HTX_FL_EOM) {
+					appctx->st0 = HTTPCLIENT_S_RES_STLINE;
+					se_fl_set(appctx->sedesc, SE_FL_EOI);
+					break;
+				}
+
+				applet_have_more_data(appctx);
+				goto process_data; /* we need to leave the IO handler once we wrote the request */
 
 			case HTTPCLIENT_S_RES_STLINE:
-				/* Request is finished, report EOI */
-				se_fl_set(appctx->sedesc, SE_FL_EOI);
-
 				/* copy the start line in the hc structure,then remove the htx block */
 				if (!co_data(res))
 					goto out;
@@ -828,6 +849,26 @@ void httpclient_applet_io_handler(struct appctx *appctx)
 				if (!sl || (!(sl->flags & HTX_SL_F_IS_RESP)))
 					goto out;
 
+				/* Skipp any 1XX interim responses */
+				if (sl->info.res.status < 200) {
+					/* Upgrade are not supported. Report an error */
+					if (sl->info.res.status == 101)
+						goto error;
+
+					while (blk) {
+						enum htx_blk_type type = htx_get_blk_type(blk);
+						uint32_t sz = htx_get_blksz(blk);
+
+						c_rew(res, sz);
+						blk = htx_remove_blk(htx, blk);
+						if (type == HTX_BLK_EOH) {
+							htx_to_buf(htx, &res->buf);
+							break;
+						}
+					}
+					break;
+				}
+
 				/* copy the status line in the httpclient */
 				hc->res.status = sl->info.res.status;
 				hc->res.vsn = istdup(htx_sl_res_vsn(sl));
@@ -839,8 +880,6 @@ void httpclient_applet_io_handler(struct appctx *appctx)
 				if (hc->ops.res_stline)
 					hc->ops.res_stline(hc);
 
-				htx_to_buf(htx, &res->buf);
-
 				/* if there is no HTX data anymore and the EOM flag is
 				 * set, leave (no body) */
 				if (htx_is_empty(htx) && htx->flags & HTX_FL_EOM)
@@ -848,6 +887,7 @@ void httpclient_applet_io_handler(struct appctx *appctx)
 				else
 					appctx->st0 = HTTPCLIENT_S_RES_HDR;
 
+				htx_to_buf(htx, &res->buf);
 				break;
 
 			case HTTPCLIENT_S_RES_HDR:
@@ -887,7 +927,6 @@ void httpclient_applet_io_handler(struct appctx *appctx)
 						}
 						blk = htx_remove_blk(htx, blk);
 					}
-					htx_to_buf(htx, &res->buf);
 
 					if (hdr_num) {
 						/* alloc and copy the headers in the httpclient struct */
@@ -909,6 +948,7 @@ void httpclient_applet_io_handler(struct appctx *appctx)
 						appctx->st0 = HTTPCLIENT_S_RES_BODY;
 					}
 				}
+				htx_to_buf(htx, &res->buf);
 				break;
 
 			case HTTPCLIENT_S_RES_BODY:
@@ -980,15 +1020,12 @@ void httpclient_applet_io_handler(struct appctx *appctx)
 					}
 				}
 
+				/* if not finished, should be called again */
+				if ((htx_is_empty(htx) && (htx->flags & HTX_FL_EOM)))
+					appctx->st0 = HTTPCLIENT_S_RES_END;
+
 				htx_to_buf(htx, &res->buf);
 
-				/* if not finished, should be called again */
-				if (!(htx_is_empty(htx) && (htx->flags & HTX_FL_EOM)))
-					goto out;
-
-
-				/* end of message, we should quit */
-				appctx->st0 = HTTPCLIENT_S_RES_END;
 				break;
 
 			case HTTPCLIENT_S_RES_END:
@@ -1098,7 +1135,12 @@ int httpclient_applet_init(struct appctx *appctx)
 	/* The request was transferred when the stream was created. So switch
 	 * directly to REQ_BODY or RES_STLINE state
 	 */
-	appctx->st0 = (hc->ops.req_payload ? HTTPCLIENT_S_REQ_BODY : HTTPCLIENT_S_RES_STLINE);
+	if (hc->ops.req_payload)
+		appctx->st0 = HTTPCLIENT_S_REQ_BODY;
+	else {
+		appctx->st0 =  HTTPCLIENT_S_RES_STLINE;
+		se_fl_set(appctx->sedesc, SE_FL_EOI);
+	}
 	return 0;
 
  out_free_addr:

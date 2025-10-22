@@ -1213,6 +1213,7 @@ int pthread_rwlock_unlock(pthread_rwlock_t *rwlock)
 }
 #endif // defined(USE_PTHREAD_EMULATION)
 
+#ifndef __APPLE__
 /* Depending on the platform and how libpthread was built, pthread_exit() may
  * involve some code in libgcc_s that would be loaded on exit for the first
  * time, causing aborts if the process is chrooted. It's harmless bit very
@@ -1233,12 +1234,15 @@ static inline void preload_libgcc_s(void)
 	if (pthread_create(&dummy_thread, NULL, dummy_thread_function, NULL) == 0)
 		pthread_join(dummy_thread, NULL);
 }
+#endif
 
 static void __thread_init(void)
 {
 	char *ptr = NULL;
 
+#ifndef __APPLE__
 	preload_libgcc_s();
+#endif
 
 	thread_cpus_enabled_at_boot = thread_cpus_enabled();
 	thread_cpus_enabled_at_boot = MIN(thread_cpus_enabled_at_boot, MAX_THREADS);
@@ -1451,6 +1455,23 @@ int thread_map_to_groups()
 		ha_thread_info[t].tid      = t;
 		ha_thread_info[t].ltid     = t - ha_thread_info[t].tg->base;
 		ha_thread_info[t].ltid_bit = 1UL << ha_thread_info[t].ltid;
+	}
+
+	/* limit thread groups to existing threads only */
+	for (g = 0; g < global.nbtgroups; g++) {
+		if (ha_tgroup_info[g].base >= global.nbthread) {
+			ha_alert("Thread-group %d only references non-existing threads (max=%d, requested %d-%d)\n",
+			         g + 1, global.nbthread, ha_tgroup_info[g].base + 1, ha_tgroup_info[g].base + ha_tgroup_info[g].count);
+			return -1;
+		}
+
+		if (ha_tgroup_info[g].base + ha_tgroup_info[g].count > global.nbthread) {
+			ha_warning("Reducing thread-group %d to %d threads (requested %d-%d, using %d-%d)\n",
+			           g + 1, global.nbthread - ha_tgroup_info[g].base,
+			           ha_tgroup_info[g].base + 1, ha_tgroup_info[g].base + ha_tgroup_info[g].count,
+			           ha_tgroup_info[g].base + 1, global.nbthread);
+			ha_tgroup_info[g].count = global.nbthread - ha_tgroup_info[g].base;
+		}
 	}
 
 	m = 0;

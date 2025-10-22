@@ -123,6 +123,22 @@ struct url_stat {
 #define FILT2_PRESERVE_QUERY    0x02
 #define FILT2_EXTRACT_CAPTURE   0x04
 
+#define FILT_OUTPUT_FMT   (FILT_COUNT_ONLY| \
+			   FILT_COUNT_STATUS| \
+			   FILT_COUNT_SRV_STATUS| \
+			   FILT_COUNT_COOK_CODES| \
+			   FILT_COUNT_TERM_CODES| \
+			   FILT_COUNT_URL_ONLY| \
+			   FILT_COUNT_URL_COUNT| \
+			   FILT_COUNT_URL_ERR| \
+			   FILT_COUNT_URL_TAVG| \
+			   FILT_COUNT_URL_TTOT| \
+			   FILT_COUNT_URL_TAVGO| \
+			   FILT_COUNT_URL_TTOTO| \
+			   FILT_COUNT_URL_BAVG| \
+			   FILT_COUNT_URL_BTOT| \
+			   FILT_COUNT_IP_COUNT)
+
 unsigned int filter = 0;
 unsigned int filter2 = 0;
 unsigned int filter_invert = 0;
@@ -192,7 +208,7 @@ void help()
 	       "                         you can also use -n to start from earlier then field %d\n"
 	       " -query                  preserve the query string for per-URL (-u*) statistics\n"
 	       "\n"
-	       "Output format - only one may be used at a time\n"
+	       "Output format - **only one** may be used at a time\n"
 	       " -c    only report the number of lines that would have been printed\n"
 	       " -pct  output connect and response times percentiles\n"
 	       " -st   output number of requests per HTTP status code\n"
@@ -898,6 +914,9 @@ int main(int argc, char **argv)
 	if (!filter && !filter2)
 		die("No action specified.\n");
 
+	if ((filter & FILT_OUTPUT_FMT) & ((filter & FILT_OUTPUT_FMT) - 1))
+		die("Please, set only one output filter.\n");
+
 	if (filter & FILT_ACC_COUNT && !filter_acc_count)
 		filter_acc_count=1;
 
@@ -1552,6 +1571,10 @@ void filter_count_srv_status(const char *accept_field, const char *time_field, s
 	if (!srv_node) {
 		/* server not yet in the tree, let's create it */
 		srv = (void *)calloc(1, sizeof(struct srv_st) + e - b + 1);
+		if (unlikely(!srv)) {
+			fprintf(stderr, "%s: not enough memory\n", __FUNCTION__);
+			exit(1);
+		}
 		srv_node = &srv->node;
 		memcpy(&srv_node->key, b, e - b);
 		srv_node->key[e - b] = '\0';
@@ -1661,6 +1684,10 @@ void filter_count_url(const char *accept_field, const char *time_field, struct t
 	 */
 	if (unlikely(!ustat))
 		ustat = calloc(1, sizeof(*ustat));
+	if (unlikely(!ustat)) {
+		fprintf(stderr, "%s: not enough memory\n", __FUNCTION__);
+		exit(1);
+	}
 
 	ustat->nb_err = err;
 	ustat->nb_req = 1;

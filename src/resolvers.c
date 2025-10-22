@@ -370,7 +370,7 @@ static inline uint16_t resolv_rnd16(void)
 
 static inline int resolv_resolution_timeout(struct resolv_resolution *res)
 {
-	return res->resolvers->timeout.resolve;
+	return (!LIST_ISEMPTY(&res->requesters) ? res->resolvers->timeout.resolve : res->resolvers->hold.valid);
 }
 
 /* Updates a resolvers' task timeout for next wake up and queue it */
@@ -649,7 +649,9 @@ int resolv_read_name(unsigned char *buffer, unsigned char *bufend,
 		/* +1 to take label len + label string */
 		label_len++;
 
-		memcpy(dest, reader, label_len);
+		for (n = 0; n < label_len; n++) {
+			dest[n] = tolower(reader[n]);
+		}
 
 		dest     += label_len;
 		nb_bytes += label_len;
@@ -817,6 +819,8 @@ static void resolv_check_response(struct resolv_resolution *res)
 					resolv_srvrq_cleanup_srv(srv);
 			}
 
+			if (eb32 == res->response.next)
+				res->response.next = NULL;
 			eb32_delete(&item->link);
 			if (item->ar_item) {
 				pool_free(resolv_answer_item_pool, item->ar_item);
@@ -1613,7 +1617,7 @@ int resolv_get_ip_from_response(struct resolv_response *r_res,
                              struct server *owner)
 {
 	struct resolv_answer_item *record, *found_record = NULL;
-	struct eb32_node *eb32;
+	struct eb32_node *eb32, *end;
 	int family_priority;
 	int currentip_found;
 	unsigned char *newip4, *newip6;
@@ -1625,6 +1629,10 @@ int resolv_get_ip_from_response(struct resolv_response *r_res,
 	/* srv is linked to an alive ip record */
 	if (owner && LIST_INLIST(&owner->ip_rec_item))
 		return RSLV_UPD_NO;
+
+	/* there is no record in the answer tree */
+	if (eb_is_empty(&r_res->answer_tree))
+		return RSLV_UPD_NO_IP_FOUND;
 
 	family_priority   = resolv_opts->family_prio;
 	allowed_duplicated_ip = resolv_opts->accept_duplicate_ip;
@@ -1646,8 +1654,10 @@ int resolv_get_ip_from_response(struct resolv_response *r_res,
 	 *  1 - current ip.
 	 * The result with the biggest score is returned.
 	 */
-
-	for (eb32 = eb32_first(&r_res->answer_tree); eb32 != NULL;  eb32 = eb32_next(eb32)) {
+	eb32 = (!r_res->next) ? eb32_first(&r_res->answer_tree) : r_res->next;
+	end = eb32;
+	r_res->next = eb32_next(eb32); /* get node for the next lookup */
+	do {
 		void *ip;
 		unsigned char ip_type;
 
@@ -1661,7 +1671,7 @@ int resolv_get_ip_from_response(struct resolv_response *r_res,
 			ip = &record->data.in6.sin6_addr;
 		}
 		else
-			continue;
+			goto next;
 		score = 0;
 
 		/* Check for preferred ip protocol. */
@@ -1673,7 +1683,7 @@ int resolv_get_ip_from_response(struct resolv_response *r_res,
 
 			/* Compare only the same addresses class. */
 			if (resolv_opts->pref_net[j].family != ip_type)
-				continue;
+				goto next;
 
 			if ((ip_type == AF_INET &&
 			     in_net_ipv4(ip,
@@ -1697,7 +1707,7 @@ int resolv_get_ip_from_response(struct resolv_response *r_res,
 
 			list_for_each_entry(srv, &record->attached_servers, ip_rec_item) {
 				if (srv == owner)
-					continue;
+					goto next;
 				if (srv->proxy == owner->proxy) {
 					already_used = 1;
 					break;
@@ -1705,7 +1715,7 @@ int resolv_get_ip_from_response(struct resolv_response *r_res,
 			}
 			if (already_used) {
 				if (!allowed_duplicated_ip) {
-					continue;
+					goto next;
 				}
 			}
 			else {
@@ -1747,7 +1757,11 @@ int resolv_get_ip_from_response(struct resolv_response *r_res,
 			}
 			max_score = score;
 		}
-	} /* list for each record entries */
+	  next:
+		eb32 = eb32_next(eb32);
+		if (eb32 == NULL)
+			eb32 = eb32_first(&r_res->answer_tree);
+	} while (eb32 != end); /* list for each record entries */
 
 	/* No IP found in the response */
 	if (!newip4 && !newip6)
@@ -1791,15 +1805,6 @@ int resolv_get_ip_from_response(struct resolv_response *r_res,
 	if (owner && found_record) {
 		LIST_DEL_INIT(&owner->ip_rec_item);
 		LIST_APPEND(&found_record->attached_servers, &owner->ip_rec_item);
-	}
-
-	eb32 = eb32_first(&r_res->answer_tree);
-	if (eb32) {
-		/* Move the first record to the end of the list, for internal
-		 * round robin.
-		 */
-		eb32_delete(eb32);
-		eb32_insert(&r_res->answer_tree, eb32);
 	}
 
 	return (currentip_found ? RSLV_UPD_NO : RSLV_UPD_SRVIP_NOT_FOUND);
@@ -1935,7 +1940,7 @@ static struct resolv_resolution *resolv_pick_resolution(struct resolvers *resolv
 							char **hostname_dn, int hostname_dn_len,
 							int query_type)
 {
-	struct resolv_resolution *res;
+	struct resolv_resolution *res = NULL;
 
 	if (!*hostname_dn)
 		goto from_pool;
@@ -1972,10 +1977,15 @@ static struct resolv_resolution *resolv_pick_resolution(struct resolvers *resolv
 
 		LIST_INIT(&res->requesters);
 		res->response.answer_tree = EB_ROOT;
+		res->response.next = NULL;
 
 		res->prefered_query_type = query_type;
 		res->query_type          = query_type;
-		res->hostname_dn         = *hostname_dn;
+		if (*hostname_dn) {
+			res->hostname_dn         = strdup(*hostname_dn);
+			if (res->hostname_dn == NULL)
+				goto err;
+		}
 		res->hostname_dn_len     = hostname_dn_len;
 
 		++resolution_uuid;
@@ -1984,6 +1994,10 @@ static struct resolv_resolution *resolv_pick_resolution(struct resolvers *resolv
 		LIST_APPEND(&resolvers->resolutions.wait, &res->list);
 	}
 	return res;
+  err:
+	if (res)
+		resolv_free_resolution(res);
+	return NULL;
 }
 
 /* deletes and frees all answer_items from the resolution's answer_list */
@@ -1992,6 +2006,7 @@ static void resolv_purge_resolution_answer_records(struct resolv_resolution *res
 	struct eb32_node *eb32, *eb32_back;
 	struct resolv_answer_item *item;
 
+	resolution->response.next = NULL;
 	for (eb32 = eb32_first(&resolution->response.answer_tree);
 	     eb32 && (eb32_back = eb32_next(eb32), 1);
 	     eb32 = eb32_back) {
@@ -2009,7 +2024,7 @@ static void resolv_free_resolution(struct resolv_resolution *resolution)
 
 	/* clean up configuration */
 	resolv_reset_resolution(resolution);
-	resolution->hostname_dn = NULL;
+	ha_free(&resolution->hostname_dn);
 	resolution->hostname_dn_len = 0;
 
 	list_for_each_entry_safe(req, reqback, &resolution->requesters, list) {
@@ -2186,7 +2201,6 @@ void resolv_detach_from_resolution_answer_items(struct resolv_resolution *res,  
 static void _resolv_unlink_resolution(struct resolv_requester *requester)
 {
 	struct resolv_resolution *res;
-	struct resolv_requester  *req;
 
 	/* Nothing to do */
 	if (!requester || !requester->resolution)
@@ -2201,31 +2215,21 @@ static void _resolv_unlink_resolution(struct resolv_requester *requester)
 	resolv_detach_from_resolution_answer_items(res,  requester);
 
 	/* We need to find another requester linked on this resolution */
-	if (!LIST_ISEMPTY(&res->requesters))
-		req = LIST_NEXT(&res->requesters, struct resolv_requester *, list);
-	else {
-		abort_resolution(res);
+	if (LIST_ISEMPTY(&res->requesters)) {
+		/* If the last requester was a stream and the resolution was a
+		 * success, keep it to use it as a cache for <hold.valid>
+		 * milliseconds.
+		 */
+		if (obj_type(requester->owner) != OBJ_TYPE_STREAM ||
+		    res->status != RSLV_STATUS_VALID ||
+		    res->resolvers->hold.valid == 0)
+			abort_resolution(res);
+		else {
+			if (!tick_isset(res->last_resolution))
+				res->last_resolution = now_ms;
+			task_wakeup(res->resolvers->t, TASK_WOKEN_OTHER);
+		}
 		return;
-	}
-
-	/* Move hostname_dn related pointers to the next requester */
-	switch (obj_type(req->owner)) {
-		case OBJ_TYPE_SERVER:
-			res->hostname_dn     = __objt_server(req->owner)->hostname_dn;
-			res->hostname_dn_len = __objt_server(req->owner)->hostname_dn_len;
-			break;
-		case OBJ_TYPE_SRVRQ:
-			res->hostname_dn     = __objt_resolv_srvrq(req->owner)->hostname_dn;
-			res->hostname_dn_len = __objt_resolv_srvrq(req->owner)->hostname_dn_len;
-			break;
-		case OBJ_TYPE_STREAM:
-			res->hostname_dn     = __objt_stream(req->owner)->resolv_ctx.hostname_dn;
-			res->hostname_dn_len = __objt_stream(req->owner)->resolv_ctx.hostname_dn_len;
-			break;
-		default:
-			res->hostname_dn     = NULL;
-			res->hostname_dn_len = 0;
-			break;
 	}
 }
 
@@ -2548,7 +2552,12 @@ struct task *process_resolvers(struct task *t, void *context, unsigned int state
 		}
 
 		if (LIST_ISEMPTY(&res->requesters)) {
-			abort_resolution(res);
+			/* Abort inactive resolution only if expired */
+			exp = tick_add(res->last_resolution, resolvers->hold.valid);
+			if (!tick_isset(res->last_resolution) || tick_is_expired(exp, now_ms)) {
+				abort_resolution(res);
+				res = resback;
+			}
 			continue;
 		}
 
@@ -2664,6 +2673,7 @@ static int resolvers_finalize_config(void)
 	const struct protocol *proto;
 	struct resolvers *resolvers;
 	struct proxy	     *px;
+	static int operating_thread = 0;
 	int err_code = 0;
 
 	enter_resolver_code();
@@ -2702,12 +2712,17 @@ static int resolvers_finalize_config(void)
 			}
 		}
 
-		/* Create the task associated to the resolvers section */
-		if ((t = task_new_anywhere()) == NULL) {
+		/* Create the task associated to the resolvers section.
+		 * We try to bind each resolvers section to a different thread
+		 * in order to avoid expensive multi-threading tasks and make
+		 * sure that the same thread deals with DNS I/O and scheduling.
+		 */
+		if ((t = task_new_on(operating_thread)) == NULL) {
 			ha_alert("resolvers '%s' : out of memory.\n", resolvers->id);
 			err_code |= (ERR_ALERT|ERR_ABORT);
 			goto err;
 		}
+		operating_thread = (operating_thread + 1) % global.nbthread;
 
 		/* Update task's parameters */
 		t->process   = process_resolvers;

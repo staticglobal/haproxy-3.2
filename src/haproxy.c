@@ -2214,19 +2214,6 @@ static void step_init_2(int argc, char** argv)
 	if (global.mode & MODE_DUMP_CFG)
 		deinit_and_exit(0);
 
-#ifdef USE_OPENSSL
-
-	/* Initialize SSL random generator. Must be called before chroot for
-	 * access to /dev/urandom, and before ha_random_boot() which may use
-	 * RAND_bytes().
-	 */
-	if (!ssl_initialize_random()) {
-		ha_alert("OpenSSL random data generator initialization failed.\n");
-		exit(EXIT_FAILURE);
-	}
-#endif
-	ha_random_boot(argv); // the argv pointer brings some kernel-fed entropy
-
 	/* now we know the buffer size, we can initialize the channels and buffers */
 	init_buffer();
 
@@ -2886,7 +2873,11 @@ void run_poll_loop()
 				wake = 0;
 		}
 
-		if (!wake) {
+		/* Note below: threads only check the quit condition when idle,
+		 * but for tid>0 we also need to skip that if the signal queue
+		 * is non-empty otherwise we risk quitting too early.
+		 */
+		if (!wake && !signal_queue_len) {
 			int i;
 
 			if (stopping) {
@@ -3183,6 +3174,19 @@ int main(int argc, char **argv)
 		limit.rlim_max = limit.rlim_cur;
 	rlim_fd_cur_at_boot = limit.rlim_cur;
 	rlim_fd_max_at_boot = limit.rlim_max;
+
+#ifdef USE_OPENSSL
+
+	/* Initialize SSL random generator. Must be called before chroot for
+	 * access to /dev/urandom, and before ha_random_boot() which may use
+	 * RAND_bytes().
+	 */
+	if (!ssl_initialize_random()) {
+		ha_alert("OpenSSL random data generator initialization failed.\n");
+		exit(EXIT_FAILURE);
+	}
+#endif
+	ha_random_boot(argv); // the argv pointer brings some kernel-fed entropy
 
 	/* process all initcalls in order of potential dependency */
 	RUN_INITCALLS(STG_PREPARE);
@@ -3608,6 +3612,8 @@ int main(int argc, char **argv)
 		struct mworker_proc *proc;
 		int sock_pair[2];
 		char *msg = NULL;
+		char c;
+		int r __maybe_unused;
 
 		if (socketpair(PF_UNIX, SOCK_STREAM, 0, sock_pair) == -1) {
 			ha_alert("[%s.main()] Cannot create socketpair to update the new worker state\n",
@@ -3629,7 +3635,6 @@ int main(int argc, char **argv)
 
 			exit(1);
 		}
-		close(sock_pair[0]);
 
 		memprintf(&msg, "_send_status READY %d\n", getpid());
 		if (send(sock_pair[1], msg, strlen(msg), 0) != strlen(msg)) {
@@ -3637,7 +3642,17 @@ int main(int argc, char **argv)
 
 			exit(1);
 		}
+
+		/* in macOS, the sock_pair[0] might be received in the master
+		 * process after it was closed in the worker, which is a
+		 * documented bug in sendmsg(2). We need to close the fd only
+		 * after confirming receipt of the "\n" from the CLI applet, so
+		 * we make sure that the fd is received correctly.
+		 */
+		shutdown(sock_pair[1], SHUT_WR);
+		r = read(sock_pair[1], &c, 1);
 		close(sock_pair[1]);
+		close(sock_pair[0]);
 		ha_free(&msg);
 
 		/* at this point the worker must have his own startup_logs buffer */

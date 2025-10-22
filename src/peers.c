@@ -637,7 +637,7 @@ static inline void peer_set_update_msg_type(char *msg_type, int use_identifier, 
  * If function returns 0, the caller should consider we were unable to encode this message (TODO:
  * check size)
  */
-static int peer_prepare_updatemsg(char *msg, size_t size, struct peer_prep_params *p)
+int peer_prepare_updatemsg(char *msg, size_t size, struct peer_prep_params *p)
 {
 	uint32_t netinteger;
 	unsigned short datalen;
@@ -1545,12 +1545,13 @@ static inline struct stksess *peer_teach_stage2_stksess_lookup(struct shared_tab
  * If it returns 0 or -1, this function leave <st> locked if already locked when entering this function
  * unlocked if not already locked when entering this function.
  */
-static inline int peer_send_teachmsgs(struct appctx *appctx, struct peer *p,
-                                      struct stksess *(*peer_stksess_lookup)(struct shared_table *),
-                                      struct shared_table *st)
+int peer_send_teachmsgs(struct appctx *appctx, struct peer *p,
+                        struct stksess *(*peer_stksess_lookup)(struct shared_table *),
+                        struct shared_table *st)
 {
 	int ret, new_pushed, use_timed;
 	int updates_sent = 0;
+	int failed_once = 0;
 
 	ret = 1;
 	use_timed = 0;
@@ -1568,7 +1569,12 @@ static inline int peer_send_teachmsgs(struct appctx *appctx, struct peer *p,
 	/* We force new pushed to 1 to force identifier in update message */
 	new_pushed = 1;
 
-	HA_RWLOCK_RDLOCK(STK_TABLE_UPDT_LOCK, &st->table->updt_lock);
+	if (HA_RWLOCK_TRYRDLOCK(STK_TABLE_UPDT_LOCK, &st->table->updt_lock) != 0) {
+		/* just don't engage here if there is any contention */
+		applet_have_more_data(appctx);
+		ret = -1;
+		goto out_unlocked;
+	}
 
 	while (1) {
 		struct stksess *ts;
@@ -1593,7 +1599,25 @@ static inline int peer_send_teachmsgs(struct appctx *appctx, struct peer *p,
 		HA_RWLOCK_RDUNLOCK(STK_TABLE_UPDT_LOCK, &st->table->updt_lock);
 
 		ret = peer_send_updatemsg(st, appctx, ts, updateid, new_pushed, use_timed);
-		HA_RWLOCK_RDLOCK(STK_TABLE_UPDT_LOCK, &st->table->updt_lock);
+
+		if (HA_RWLOCK_TRYRDLOCK(STK_TABLE_UPDT_LOCK, &st->table->updt_lock) != 0) {
+			if (failed_once) {
+				/* we've already faced contention twice in this
+				 * loop, this is getting serious, do not insist
+				 * anymore and come back later
+				 */
+				HA_ATOMIC_DEC(&ts->ref_cnt);
+				applet_have_more_data(appctx);
+				ret = -1;
+				goto out_unlocked;
+			}
+			/* OK contention happens, for this one we'll wait on the
+			 * lock, but only once.
+			 */
+			failed_once++;
+			HA_RWLOCK_RDLOCK(STK_TABLE_UPDT_LOCK, &st->table->updt_lock);
+		}
+
 		HA_ATOMIC_DEC(&ts->ref_cnt);
 		if (ret <= 0)
 			break;
@@ -1623,6 +1647,7 @@ static inline int peer_send_teachmsgs(struct appctx *appctx, struct peer *p,
 
  out:
 	HA_RWLOCK_RDUNLOCK(STK_TABLE_UPDT_LOCK, &st->table->updt_lock);
+ out_unlocked:
 	return ret;
 }
 
@@ -1689,8 +1714,8 @@ static inline int peer_send_teach_stage2_msgs(struct appctx *appctx, struct peer
  * update ID.
  * <totl> is the length of the stick-table update message computed upon receipt.
  */
-static int peer_treat_updatemsg(struct appctx *appctx, struct peer *p, int updt, int exp,
-                                char **msg_cur, char *msg_end, int msg_len, int totl)
+int peer_treat_updatemsg(struct appctx *appctx, struct peer *p, int updt, int exp,
+                         char **msg_cur, char *msg_end, int msg_len, int totl)
 {
 	struct shared_table *st = p->remote_table;
 	struct stktable *table;
@@ -2604,8 +2629,8 @@ static inline int peer_treat_awaited_msg(struct appctx *appctx, struct peer *pee
  * only reset at the end. In the mean time, it always point on a table.
  */
 
-static inline int peer_send_msgs(struct appctx *appctx,
-                                 struct peer *peer, struct peers *peers)
+int peer_send_msgs(struct appctx *appctx,
+                   struct peer *peer, struct peers *peers)
 {
 	int repl;
 
@@ -2895,7 +2920,7 @@ static inline void init_connected_peer(struct peer *peer, struct peers *peers)
 /*
  * IO Handler to handle message exchange with a peer
  */
-static void peer_io_handler(struct appctx *appctx)
+void peer_io_handler(struct appctx *appctx)
 {
 	struct stconn *sc = appctx_sc(appctx);
 	struct stream *s = __sc_strm(sc);
@@ -3757,13 +3782,18 @@ struct task *process_peer_sync(struct task * task, void *context, unsigned int s
  */
 int peers_init_sync(struct peers *peers)
 {
+	static uint operating_thread = 0;
 	struct peer * curpeer;
 
 	for (curpeer = peers->remote; curpeer; curpeer = curpeer->next) {
 		peers->peers_fe->maxconn += 3;
 	}
 
-	peers->sync_task = task_new_anywhere();
+	/* go backwards so as to distribute the load to other threads
+	 * than the ones operating the stick-tables for small confs.
+	 */
+	operating_thread = (operating_thread - 1) % global.nbthread;
+	peers->sync_task = task_new_on(operating_thread);
 	if (!peers->sync_task)
 		return 0;
 

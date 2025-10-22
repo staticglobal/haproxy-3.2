@@ -2968,7 +2968,16 @@ __LJMP static int hlua_socket_receive_yield(struct lua_State *L, int status, lua
 	}
 
 	/* Consume data. */
-	co_skip(oc, len + skip_at_end);
+	if (len + skip_at_end) {
+		co_skip(oc, len + skip_at_end);
+		oc->flags |= CF_WRITE_EVENT | CF_WROTE_DATA;
+		if (s->scb->room_needed < 0 || channel_recv_max(oc) >= s->scb->room_needed)
+			sc_have_room(s->scb);
+		sc_ep_report_send_activity(s->scf);
+	}
+	else if (!s->scb->room_needed)
+		sc_have_room(s->scb);
+
 
 	/* Don't wait anything. */
 	applet_will_consume(appctx);
@@ -3222,6 +3231,7 @@ hlua_socket_write_yield_return:
 		WILL_LJMP(luaL_error(L, "out of memory"));
 	}
 	xref_unlock(&socket->xref, peer);
+	sc_need_room(sc, channel_recv_max(&s->req) + 1);
 	MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_socket_write_yield, TICK_ETERNITY, 0));
 	return 0;
 }
@@ -6020,21 +6030,20 @@ __LJMP static int hlua_applet_http_recv_yield(lua_State *L, int status, lua_KCon
 		uint32_t vlen;
 
 		vlen = sz;
-		if (len > 0 && vlen > len)
-			vlen = len;
-		if (vlen > count) {
-			if (type != HTX_BLK_DATA)
-				break;
-			vlen = count;
-		}
-
 		switch (type) {
 			case HTX_BLK_UNUSED:
 				break;
 
 			case HTX_BLK_DATA:
 				v = htx_get_blk_value(htx, blk);
+				vlen = v.len;
+				if (len > 0 && vlen > len)
+					vlen = len;
+				if (vlen > count)
+					vlen = count;
 				luaL_addlstring(&luactx->b, v.ptr, vlen);
+				if (len > 0)
+					len -= vlen;
 				break;
 
 			case HTX_BLK_TLR:
@@ -6048,8 +6057,6 @@ __LJMP static int hlua_applet_http_recv_yield(lua_State *L, int status, lua_KCon
 
 		c_rew(req, vlen);
 		count -= vlen;
-		if (len > 0)
-			len -= vlen;
 		if (sz == vlen)
 			blk = htx_remove_blk(htx, blk);
 		else {
@@ -13399,7 +13406,24 @@ static int hlua_load_per_thread(char **args, int section_type, struct proxy *cur
 		return -1;
 	}
 	for (i = 1; *(args[i]) != 0; i++) {
-		per_thread_load[len][i - 1] = strdup(args[i]);
+		/* first arg is filename */
+		if (i == 1 && args[1][0] != '/') {
+			char *curpath;
+			char *fullpath = NULL;
+
+			/* filename is provided using relative path, store the absolute path
+			 * to take current chdir into account for other threads file load
+			 * which occur later
+			 */
+			curpath = getcwd(trash.area, trash.size);
+			if (!curpath) {
+				memprintf(err, "failed to retrieve cur path");
+				return -1;
+			}
+			per_thread_load[len][i - 1] = memprintf(&fullpath, "%s/%s", curpath, args[1]);
+		}
+		else
+			per_thread_load[len][i - 1] = strdup(args[i]);
 		if (per_thread_load[len][i - 1] == NULL) {
 			memprintf(err, "out of memory error");
 			return -1;

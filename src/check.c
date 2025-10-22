@@ -1580,7 +1580,7 @@ void free_check(struct check *check)
 	}
 
 	ha_free(&check->pool_conn_name);
-
+	ha_free(&check->alpn_str);
 	task_destroy(check->task);
 
 	check_release_buf(check, &check->bi);
@@ -1819,10 +1819,8 @@ int init_srv_check(struct server *srv)
 		 * specified.
 		 */
 		if (!srv->check.port && !is_addr(&srv->check.addr)) {
-			if (!srv->check.use_ssl && srv->use_ssl != -1) {
-				srv->check.use_ssl = srv->use_ssl;
-				srv->check.xprt    = srv->xprt;
-			}
+			if (!srv->check.use_ssl && srv->use_ssl != -1)
+				srv->check.xprt = srv->xprt;
 			else if (srv->check.use_ssl == 1)
 				srv->check.xprt = xprt_get(XPRT_SSL);
 			srv->check.send_proxy |= (srv->pp_opts);
